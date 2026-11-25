@@ -28,21 +28,46 @@ namespace Stark {
 namespace Gfx {
 
 /**
- * Step 01 placeholder texture implementation for native PSP sceGu driver.
+ * Native PSP GE 3D texture storing up to 8 aligned POT RGBA8888 mip levels (<= 512x512).
  */
 class PspGuTexture : public Texture {
 public:
+	static const uint32 kMaxMipLevels = 8;
+
+	struct MipLevel {
+		void *data;
+		uint32 byteSize;
+		uint16 texW;
+		uint16 texH;
+		uint16 stride;
+	};
+
 	PspGuTexture();
 	~PspGuTexture() override;
 
 	void bind() const override;
+	void bindWrapped(int wrapU, int wrapV, bool linearFilter) const;
 	void setLevelCount(uint32 count) override;
 	void addLevel(uint32 level, const Graphics::Surface *surface, const byte *palette = nullptr) override;
 
+	uint32 getLevelCount() const { return _uploadedLevels; }
+	uint16 getBaseWidth() const { return _baseWidth; }
+	uint16 getBaseHeight() const { return _baseHeight; }
+	bool isIndexedT8() const { return _isIndexedT8; }
+
 private:
-	uint32 _levelCount;
-	mutable bool _warnedBind;
-	bool _warnedAdd;
+	void releaseLevels();
+	void releaseClut();
+
+	MipLevel _levels[kMaxMipLevels];
+	uint32 *_clut;
+	uint32 _clutBytes;
+	uint32 _requestedLevels;
+	uint32 _uploadedLevels;
+	uint16 _baseWidth;
+	uint16 _baseHeight;
+	bool _isIndexedT8;
+	mutable uint32 _lastBoundFrameSeq;
 };
 
 } // End of namespace Gfx

@@ -23,15 +23,34 @@
 #define STARK_GFX_PSPGU_BITMAP_H
 
 #include "engines/stark/gfx/bitmap.h"
+#include "common/array.h"
 
 namespace Stark {
 namespace Gfx {
 
 /**
- * Step 01 placeholder 2D bitmap implementation for native PSP sceGu driver.
+ * Native PSP GE 2D bitmap with automatic <=512 POT tiling, 1-texel overlap
+ * filter gutters, edge clamping, and lazy T8 alpha mask for surface fading.
  */
 class PspGuBitmap : public Bitmap {
 public:
+	struct Tile {
+		uint16 srcX;
+		uint16 srcY;
+		uint16 contentW;
+		uint16 contentH;
+		uint16 padL;
+		uint16 padT;
+		uint16 texW;
+		uint16 texH;
+		uint16 stride;
+		int psm;
+		void *pixels;
+		uint32 byteSize;
+		uint8 *alphaMask;
+		uint32 alphaByteSize;
+	};
+
 	explicit PspGuBitmap(const Graphics::Surface *surface = nullptr, const byte *palette = nullptr);
 	~PspGuBitmap() override;
 
@@ -40,10 +59,22 @@ public:
 	void setSamplingFilter(SamplingFilter filter) override;
 	Graphics::PixelFormat getBestPixelFormat() const override;
 
+	SamplingFilter getSamplingFilter() const { return _samplingFilter; }
+	uint32 getTileCount() const { return _tiles.size(); }
+	const Tile &getTile(uint32 index) const { return _tiles[index]; }
+
+	bool ensureAlphaMasks() const;
+	void markDrawn(uint32 frameSeq) const { _lastDrawnFrameSeq = frameSeq; }
+
+	static const uint32 *getAlphaFadeClut();
+
 private:
+	void releaseTiles();
+	void buildAlphaMaskForTile(Tile &tile) const;
+
+	mutable Common::Array<Tile> _tiles;
 	SamplingFilter _samplingFilter;
-	mutable bool _warnedBind;
-	bool _warnedUpdate;
+	mutable uint32 _lastDrawnFrameSeq;
 };
 
 } // End of namespace Gfx

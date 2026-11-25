@@ -31,6 +31,28 @@ namespace Stark {
 namespace Gfx {
 
 /**
+ * Shared PSP GE conversion and memory-budget utilities for Step 03+ resources.
+ */
+uint32 pspGuNextPow2Clamped(uint32 value, uint32 minPow2 = 8, uint32 maxPow2 = 512);
+int pspGuClassifySurfacePsm(const Graphics::Surface *src, const byte *palette);
+void pspGuCopySurfaceRectToTile(const Graphics::Surface *src, const byte *palette,
+                                int32 srcX, int32 srcY, int32 copyW, int32 copyH,
+                                void *dst, uint32 dstStride, int psm);
+void pspGuCopySurfaceRectToRgba8888(const Graphics::Surface *src, const byte *palette,
+                                    int32 srcX, int32 srcY, int32 copyW, int32 copyH,
+                                    uint32 *dst, uint32 dstStride);
+void pspGuResampleSurfaceToRgba8888(const Graphics::Surface *src, const byte *palette,
+                                    uint32 dstW, uint32 dstH, uint32 *dst, uint32 dstStride);
+void pspGuTrackBitmapBytes(int32 deltaBytes);
+void pspGuTrackTextureBytes(int32 deltaBytes);
+void pspGuTrackAuxBytes(int32 deltaBytes);
+uint32 pspGuGetLiveBitmapBytes();
+uint32 pspGuGetPeakBitmapBytes();
+uint32 pspGuGetLiveTextureBytes();
+uint32 pspGuGetPeakTextureBytes();
+uint32 pspGuGetLiveAuxBytes();
+
+/**
  * Native PSP sceGu / sceGum graphics driver for STARK.
  */
 class PspGuDriver : public Driver {
@@ -58,18 +80,28 @@ public:
 	void set3DMode() override;
 	bool computeLightsEnabled() override;
 
+	PspGuSession *getSession() const { return _session; }
 	bool isSessionReady() const { return _sessionReady; }
+	const Common::Rect &getViewport() const { return _viewport; }
+	const Common::Rect &getUnscaledViewport() const { return _unscaledViewport; }
 	const Common::Rect &getRtViewport() const { return _rtViewport; }
-	void mapLogical2DToRt(float lx, float ly, float &outX, float &outY) const;
-	void reportUnimplemented(const char *methodName);
+	uint32 getFrameSeq() const { return _frameSeq; }
 
-private:
 	bool ensureFrameBegun();
-	void updateRtViewport();
 	void applySceneViewport() const;
 	void applyDepthConfig(bool reverseDepth) const;
-	void drawStep02ValidationScene();
-	void verifyStep02Contracts();
+	void mapLogical2DToRt(float lx, float ly, float &outX, float &outY) const;
+	void mapLogical2DRectToRt(int32 destX, int32 destY, uint32 rectW, uint32 rectH,
+	                          bool noScalingOverride, bool snapToGrid,
+	                          float &outX0, float &outY0, float &outX1, float &outY1) const;
+	void reportUnimplemented(const char *methodName);
+
+	static void ensureResourceSafeToModify(uint32 drawnFrameSeq);
+
+private:
+	void updateRtViewport();
+	void verifyStartupContracts();
+	bool verifyStep03SurfaceAndTextureContracts(uint32 *readbackBuf, uint32 readbackStride);
 
 	PspGuSession *_session;
 	Common::Rect _viewport;
@@ -78,7 +110,7 @@ private:
 	bool _sessionReady;
 	bool _clearRequested;
 	bool _reverseDepth;
-	uint32 _smokeFrameIndex;
+	uint32 _frameSeq;
 	uint32 _unimplementedMask;
 };
 

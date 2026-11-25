@@ -30,7 +30,8 @@ namespace Gfx {
 class PspGuDriver;
 
 /**
- * Step 01 placeholder 2D surface renderer for native PSP sceGu driver.
+ * Native PSP GE 2D surface renderer supporting premultiplied alpha blending,
+ * tiled large bitmaps, solid fills, snap-to-grid, and signed per-pixel fade.
  */
 class PspGuSurfaceRenderer : public SurfaceRenderer {
 public:
@@ -38,10 +39,14 @@ public:
 	~PspGuSurfaceRenderer() override;
 
 	void render(const Bitmap *bitmap, const Common::Point &dest) override;
-	void render(const Bitmap *bitmap, const Common::Point &dest, uint width, uint height) override;
-	void fill(const Color &color, const Common::Point &dest, uint width, uint height) override;
+	void render(const Bitmap *bitmap, const Common::Point &dest, uint dstW, uint dstH) override;
+	void fill(const Color &color, const Common::Point &dest, uint dstW, uint dstH) override;
 
 private:
+	void prepare2DState() const;
+	bool clipQuadToViewport(float &x0, float &y0, float &x1, float &y1,
+	                        float *u0, float *v0, float *u1, float *v1) const;
+
 	PspGuDriver *_gfx;
 };
 

@@ -30,7 +30,7 @@ namespace Gfx {
 class PspGuDriver;
 
 /**
- * Step 01 placeholder screen fade renderer for native PSP sceGu driver.
+ * Native PSP GE full-viewport fade renderer (black fade overlay).
  */
 class PspGuFadeRenderer : public FadeRenderer {
 public:
