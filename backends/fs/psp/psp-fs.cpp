@@ -164,11 +164,13 @@ bool PSPFilesystemNode::getChildren(AbstractFSList &myList, ListMode mode, bool 
 	PSP_DEBUG_PRINT_FUNC("Current path[%s]\n", _path.c_str());
 
 	int dfd  = sceIoDopen(_path.c_str());
-	if (dfd > 0) {
+	if (dfd >= 0) {
 		SceIoDirent dir;
-		memset(&dir, 0, sizeof(dir));
 
-		while (sceIoDread(dfd, &dir) > 0) {
+		while (true) {
+			memset(&dir, 0, sizeof(dir));
+			if (sceIoDread(dfd, &dir) <= 0)
+				break;
 			// Skip 'invisible files
 			if (dir.d_name[0] == '.')
 				continue;
@@ -184,7 +186,7 @@ bool PSPFilesystemNode::getChildren(AbstractFSList &myList, ListMode mode, bool 
 			newPath += dir.d_name;
 
 			entry._path = newPath;
-			entry._isDirectory = dir.d_stat.st_attr & FIO_SO_IFDIR;
+			entry._isDirectory = (dir.d_stat.st_attr & FIO_SO_IFDIR) || FIO_S_ISDIR(dir.d_stat.st_mode);
 
 			PSP_DEBUG_PRINT_FUNC("Child[%s], %s\n", entry._path.c_str(), entry._isDirectory ? "dir" : "file");
 

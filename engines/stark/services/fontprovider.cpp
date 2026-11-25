@@ -27,6 +27,7 @@
 
 #include "common/archive.h"
 #include "common/formats/ini-file.h"
+#include "common/memstream.h"
 
 #include "graphics/font.h"
 #include "graphics/fontman.h"
@@ -38,6 +39,12 @@ FontProvider::FontProvider() {
 }
 
 FontProvider::~FontProvider() {
+	_smallFont = FontHolder();
+	_bigFont   = FontHolder();
+	for (uint i = 0; i < ARRAYSIZE(_customFonts); i++) {
+		_customFonts[i] = FontHolder();
+	}
+	_ttfDataCache.clear();
 }
 
 void FontProvider::initFonts() {
@@ -124,11 +131,33 @@ FontProvider::FontHolder::FontHolder(FontProvider *fontProvider, const Common::S
 	_scaledHeight = StarkGfx->scaleHeightOriginalToCurrent(_originalHeight);
 
 	// Fetch the font file name
+	const Common::String &ttfFile = fontProvider->_ttfFileMap[_name];
 	Common::Path ttfFileName("fonts");
-	ttfFileName.joinInPlace(fontProvider->_ttfFileMap[_name]);
+	ttfFileName.joinInPlace(ttfFile);
 
-	// Initialize the font
-	Common::SeekableReadStream *s = SearchMan.createReadStreamForMember(ttfFileName);
+	// Cache raw TTF bytes in memory so persistent font handles do not exhaust
+	// platform file descriptors (e.g. PSP ms0: concurrent open file limits).
+	if (!fontProvider->_ttfDataCache.contains(ttfFile)) {
+		Common::SeekableReadStream *diskStream = SearchMan.createReadStreamForMember(ttfFileName);
+		if (diskStream) {
+			const int64 size = diskStream->size();
+			if (size > 0) {
+				Common::Array<byte> &buf = fontProvider->_ttfDataCache[ttfFile];
+				buf.resize((uint32)size);
+				if (diskStream->read(buf.data(), (uint32)size) != (uint32)size) {
+					fontProvider->_ttfDataCache.erase(ttfFile);
+				}
+			}
+			delete diskStream;
+		}
+	}
+
+	// Initialize the font from the shared memory buffer
+	Common::SeekableReadStream *s = nullptr;
+	if (fontProvider->_ttfDataCache.contains(ttfFile)) {
+		const Common::Array<byte> &buf = fontProvider->_ttfDataCache[ttfFile];
+		s = new Common::MemoryReadStream(buf.data(), buf.size(), DisposeAfterUse::NO);
+	}
 	if (s) {
 		Graphics::TTFRenderMode renderMode = StarkSettings->isFontAntialiasingEnabled() ?
 		            Graphics::kTTFRenderModeLight : Graphics::kTTFRenderModeMonochrome;

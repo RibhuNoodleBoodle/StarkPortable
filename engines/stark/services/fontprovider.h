@@ -22,6 +22,7 @@
 #ifndef STARK_SERVICES_FONT_PROVIDER_H
 #define STARK_SERVICES_FONT_PROVIDER_H
 
+#include "common/array.h"
 #include "common/hash-str.h"
 #include "common/ptr.h"
 
@@ -85,6 +86,7 @@ private:
 	FontHolder _customFonts[8];
 
 	Common::StringMap _ttfFileMap;
+	Common::HashMap<Common::String, Common::Array<byte>, Common::IgnoreCase_Hash, Common::IgnoreCase_EqualTo> _ttfDataCache;
 };
 
 } // End of namespace Stark
