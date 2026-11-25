@@ -22,7 +22,12 @@
 #include "engines/stark/gfx/driver.h"
 #include "engines/stark/gfx/opengl.h"
 #include "engines/stark/gfx/opengls.h"
+#if defined(__PSP__)
+#include "engines/stark/gfx/pspgu.h"
+#endif
+#if defined(USE_TINYGL) && !defined(__PSP__)
 #include "engines/stark/gfx/tinygl.h"
+#endif
 #include "engines/stark/services/services.h"
 #include "engines/stark/services/settings.h"
 
@@ -43,6 +48,14 @@ namespace Gfx {
 
 Driver *Driver::create() {
 	Common::String rendererConfig = ConfMan.get("renderer");
+#if defined(__PSP__)
+	if (rendererConfig == "tinygl" || rendererConfig == "software") {
+		debug("STARK PSP: Resolving renderer '%s' to native sceGu driver", rendererConfig.c_str());
+	}
+	debug("STARK PSP: Selecting native sceGu driver (logical %dx%d)", kOriginalWidth, kOriginalHeight);
+	initGraphics(kOriginalWidth, kOriginalHeight, nullptr);
+	return new PspGuDriver();
+#else
 	Graphics::RendererType desiredRendererType = Graphics::Renderer::parseTypeCode(rendererConfig);
 	Graphics::RendererType matchingRendererType = Graphics::Renderer::getBestMatchingAvailableType(desiredRendererType,
 #if defined(USE_OPENGL_GAME)
@@ -80,6 +93,7 @@ Driver *Driver::create() {
 #endif
 	/* We should never end up here, getBestMatchingRendererType would have failed before */
 	error("Unable to create a renderer");
+#endif
 }
 
 const Graphics::PixelFormat Driver::getRGBAPixelFormat() {

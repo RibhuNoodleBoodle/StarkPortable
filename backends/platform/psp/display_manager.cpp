@@ -21,9 +21,12 @@
 
 #define FORBIDDEN_SYMBOL_ALLOW_ALL
 
+#include <malloc.h>
 #include <pspgu.h>
 #include <pspdisplay.h>
 #include <pspthreadman.h>
+#include <psputils.h>
+#include <string.h>
 
 #include "common/scummsys.h"
 #include "backends/base-backend.h"
@@ -170,6 +173,7 @@ int MasterGuRenderer::guCallback(int, int, void *__this) {
 	sceGuSync(0, 0);				// make sure we wait for GU to finish
 	sceDisplayWaitVblankStartCB();	// wait for v-blank without eating main thread cycles
 	sceGuSwapBuffers();				// swap the back and front buffers
+	_this->_guSwaps++;
 
 	_this->_renderFinished = true;	// Only this thread can set the variable to true
 
@@ -238,6 +242,7 @@ inline void MasterGuRenderer::guPreRender() {
 	_lastRenderTime = g_system->getMillis();
 #endif /* ENABLE_RENDER_MEASURE */
 
+	_guStarts++;
 	sceGuStart(0, _displayList);
 
 	sceGuClearColor(0xFF000000);
@@ -255,12 +260,20 @@ inline void MasterGuRenderer::guPreRender() {
 inline void MasterGuRenderer::guPostRender() {
 	DEBUG_ENTER_FUNC();
 
+	_guFinishes++;
 	sceGuFinish();
 #ifdef USE_DISPLAY_CALLBACK
-	if (_callbackId < 0)
+	if (_callbackId < 0) {
 		PSP_ERROR("bad callbackId[%d]\n", _callbackId);
-	else
+		sceGuSync(0, 0);
+		sceDisplayWaitVblankStart();
+		sceGuSwapBuffers();
+		_guSwaps++;
+		_renderFinished = true;
+		_renderSema.give();
+	} else {
 		sceKernelNotifyCallback(_callbackId, 0);	// notify the callback. Nothing extra to pass
+	}
 #else
 	sceGuSync(0, 0);
 
@@ -271,23 +284,311 @@ inline void MasterGuRenderer::guPostRender() {
 
 	sceDisplayWaitVblankStart();
 	sceGuSwapBuffers();
+	_guSwaps++;
 	_renderFinished = true;
 #endif /* !USE_DISPLAY_CALLBACK */
+}
+
+void MasterGuRenderer::beginNativeFrame(void *displayList) {
+	DEBUG_ENTER_FUNC();
+#ifdef USE_DISPLAY_CALLBACK
+	sleepUntilRenderFinished();
+	_renderSema.take();
+	_renderFinished = false;
+#endif
+	_guStarts++;
+	sceGuStart(GU_DIRECT, displayList);
+	sceGuOffset(2048 - (PSP_SCREEN_WIDTH / 2), 2048 - (PSP_SCREEN_HEIGHT / 2));
+	sceGuViewport(2048, 2048, PSP_SCREEN_WIDTH, PSP_SCREEN_HEIGHT);
+	sceGuScissor(0, 0, PSP_SCREEN_WIDTH, PSP_SCREEN_HEIGHT);
+	sceGuEnable(GU_SCISSOR_TEST);
+	sceGuFrontFace(GU_CW);
+}
+
+void MasterGuRenderer::finishNativeFrame() {
+	guPostRender();
 }
 
 void MasterGuRenderer::guShutDown() {
 	sceGuTerm();
 }
 
+// Class PspGuSession -------------------------------------------------------
+
+static PspGuSession *s_backendGuSession = 0;
+
+PspGuSession *PspGuSession::getBackendSession() {
+	return s_backendGuSession;
+}
+
+PspGuSession::PspGuSession() :
+		_displayManager(0),
+		_displayList(0),
+		_vertexArena(0),
+		_vertexOffset(0),
+		_ownerName(0),
+		_active(false),
+		_frameOpen(false),
+		_suspended(false),
+		_suspendRegistered(false),
+		_injectAllocFail(false),
+		_suspendable(this) {
+	memset(&_stats, 0, sizeof(_stats));
+}
+
+PspGuSession::~PspGuSession() {
+	release();
+}
+
+void PspGuSession::bindDisplayManager(DisplayManager *displayManager) {
+	_displayManager = displayManager;
+	s_backendGuSession = displayManager ? this : 0;
+}
+
+void PspGuSession::freeBuffers() {
+	if (_displayList) {
+		free(_displayList);
+		_displayList = 0;
+	}
+	if (_vertexArena) {
+		free(_vertexArena);
+		_vertexArena = 0;
+	}
+	_vertexOffset = 0;
+}
+
+void PspGuSession::syncGlobalCounters() {
+	if (_displayManager) {
+		_displayManager->getMasterGuRenderer().getGuCounters(_stats.starts, _stats.finishes, _stats.swaps);
+	}
+}
+
+bool PspGuSession::acquire(const char *ownerName) {
+	if (!_displayManager) {
+		return false;
+	}
+	if (_active) {
+		_stats.duplicateAcquireRejects++;
+		PSP_ERROR("PspGuSession: duplicate acquire rejected for '%s' (owned by '%s')\n",
+		          ownerName ? ownerName : "unknown", _ownerName ? _ownerName : "unknown");
+		return false;
+	}
+
+	_displayManager->waitUntilRenderFinished();
+	sceGuSync(0, 0);
+
+	if (_injectAllocFail) {
+		_injectAllocFail = false;
+		_stats.allocFailures++;
+		freeBuffers();
+		return false;
+	}
+
+	_displayList = (uint8 *)memalign(64, kDisplayListSize);
+	_vertexArena = (uint8 *)memalign(64, kVertexArenaSize);
+	if (!_displayList || !_vertexArena) {
+		_stats.allocFailures++;
+		freeBuffers();
+		return false;
+	}
+
+	memset(_displayList, 0, kDisplayListSize);
+	memset(_vertexArena, 0, kVertexArenaSize);
+	sceKernelDcacheWritebackRange(_displayList, kDisplayListSize);
+	sceKernelDcacheWritebackRange(_vertexArena, kVertexArenaSize);
+
+	_vertexOffset = 0;
+	_ownerName = ownerName;
+	_active = true;
+	_frameOpen = false;
+	_suspended = false;
+	_stats.acquires++;
+
+	if (!_suspendRegistered) {
+		_suspendRegistered = PowerManager::instance().registerForSuspend(&_suspendable);
+	}
+	syncGlobalCounters();
+	return true;
+}
+
+void PspGuSession::release() {
+	if (_frameOpen && _displayManager) {
+		_displayManager->getMasterGuRenderer().finishNativeFrame();
+		_frameOpen = false;
+	}
+	if (_displayManager) {
+		_displayManager->waitUntilRenderFinished();
+	}
+	sceGuSync(0, 0);
+
+	if (_suspendRegistered) {
+		PowerManager::instance().unregisterForSuspend(&_suspendable);
+		_suspendRegistered = false;
+	}
+
+	const bool wasActive = _active;
+	_active = false;
+	_frameOpen = false;
+	_suspended = false;
+	_ownerName = 0;
+	freeBuffers();
+
+	if (wasActive) {
+		_stats.releases++;
+		syncGlobalCounters();
+	}
+}
+
+bool PspGuSession::beginFrame() {
+	if (!_active || !_displayManager || _frameOpen || _suspended) {
+		return false;
+	}
+	_displayManager->getMasterGuRenderer().beginNativeFrame(_displayList);
+	_vertexOffset = 0;
+	_frameOpen = true;
+	syncGlobalCounters();
+	return true;
+}
+
+void *PspGuSession::allocVertices(uint32 bytes, uint32 alignment) {
+	if (!_active || !_frameOpen || !_vertexArena || bytes == 0) {
+		return 0;
+	}
+	if (alignment < 4) {
+		alignment = 4;
+	}
+	const uint32 alignedOffset = (_vertexOffset + alignment - 1) & ~(alignment - 1);
+	if (alignedOffset > kVertexArenaSize || bytes > kVertexArenaSize - alignedOffset) {
+		return 0;
+	}
+	void *ptr = _vertexArena + alignedOffset;
+	_vertexOffset = alignedOffset + bytes;
+	_stats.lastVertexBytes = _vertexOffset;
+	if (_vertexOffset > _stats.peakVertexBytes) {
+		_stats.peakVertexBytes = _vertexOffset;
+	}
+	return ptr;
+}
+
+void PspGuSession::flushDataRange(const void *ptr, uint32 bytes) const {
+	if (!ptr || bytes == 0) {
+		return;
+	}
+	const uintptr start = (uintptr)ptr & ~(uintptr)63;
+	const uintptr end = ((uintptr)ptr + bytes + 63) & ~(uintptr)63;
+	sceKernelDcacheWritebackRange((const void *)start, (unsigned int)(end - start));
+}
+
+uint32 PspGuSession::getDisplayListBytesUsed() const {
+	if (!_frameOpen) {
+		return _stats.lastListBytes;
+	}
+	const int used = sceGuCheckList();
+	return used > 0 ? (uint32)used : 0;
+}
+
+bool PspGuSession::hasDisplayListHeadroom(uint32 neededBytes) const {
+	if (!_frameOpen) {
+		return false;
+	}
+	const uint32 used = getDisplayListBytesUsed();
+	return used + neededBytes + kDisplayListReserve <= kDisplayListSize;
+}
+
+bool PspGuSession::overlayRePresent() {
+	if (!_active || !_displayManager) {
+		return false;
+	}
+	if (!_displayManager->hasAnyOverlayVisible()) {
+		return false;
+	}
+	if (_frameOpen) {
+		_displayManager->renderOverlayClients(true);
+		_stats.overlayRePresents++;
+		return true;
+	}
+	const bool presented = _displayManager->renderAll();
+	if (presented) {
+		_stats.overlayRePresents++;
+	}
+	syncGlobalCounters();
+	return presented;
+}
+
+bool PspGuSession::submitFrame(bool compositeOverlay) {
+	if (!_active || !_displayManager || !_frameOpen) {
+		return false;
+	}
+	if (_vertexOffset > 0 && _vertexArena) {
+		flushDataRange(_vertexArena, _vertexOffset);
+	}
+	if (compositeOverlay && _displayManager->hasAnyOverlayVisible()) {
+		_displayManager->renderOverlayClients(true);
+		_stats.overlayRePresents++;
+	}
+	const uint32 listBytes = getDisplayListBytesUsed();
+	_stats.lastListBytes = listBytes;
+	if (listBytes > _stats.peakListBytes) {
+		_stats.peakListBytes = listBytes;
+	}
+
+	_displayManager->getMasterGuRenderer().finishNativeFrame();
+	_frameOpen = false;
+	syncGlobalCounters();
+	return true;
+}
+
+void PspGuSession::waitFrame() {
+	if (_displayManager) {
+		_displayManager->waitUntilRenderFinished();
+	}
+	sceGuSync(0, 0);
+	syncGlobalCounters();
+}
+
+int PspGuSession::onSuspend() {
+	if (!_active) {
+		return 0;
+	}
+	_suspended = true;
+	if (_frameOpen && _displayManager) {
+		_displayManager->getMasterGuRenderer().finishNativeFrame();
+		_frameOpen = false;
+	}
+	if (_displayManager) {
+		_displayManager->waitUntilRenderFinished();
+	}
+	sceGuSync(0, 0);
+	_stats.suspendCount++;
+	syncGlobalCounters();
+	return 0;
+}
+
+int PspGuSession::onResume() {
+	if (!_active) {
+		return 0;
+	}
+	_suspended = false;
+	_stats.resumeCount++;
+	if (_displayManager && _displayManager->hasAnyOverlayVisible()) {
+		overlayRePresent();
+	}
+	syncGlobalCounters();
+	return 0;
+}
+
 
 // Class DisplayManager -----------------------------------------------------
 
 DisplayManager::~DisplayManager() {
+	_nativeSession.release();
 	_masterGuRenderer.guShutDown();
 }
 
 void DisplayManager::init() {
 	DEBUG_ENTER_FUNC();
+
+	_nativeSession.bindDisplayManager(this);
 
 	_displayParams.outputBitsPerPixel = 32;	// can be changed to produce 16-bit output
 
@@ -388,6 +689,62 @@ void DisplayManager::waitUntilRenderFinished() {
 #endif /* USE_DISPLAY_CALLBACK */
 }
 
+void DisplayManager::releaseNativeSessionOnEngineDone() {
+	if (_nativeSession.isActive()) {
+		_nativeSession.release();
+	}
+}
+
+bool DisplayManager::hasAnyOverlayVisible() const {
+	return (_imageViewer && _imageViewer->isVisible()) ||
+	       (_overlay && _overlay->isVisible()) ||
+	       (_cursor && _cursor->isVisible()) ||
+	       (_keyboard && _keyboard->isVisible());
+}
+
+void DisplayManager::prepareOverlayGuState() {
+	sceGuOffset(2048 - (PSP_SCREEN_WIDTH / 2), 2048 - (PSP_SCREEN_HEIGHT / 2));
+	sceGuViewport(2048, 2048, PSP_SCREEN_WIDTH, PSP_SCREEN_HEIGHT);
+	sceGuScissor(0, 0, PSP_SCREEN_WIDTH, PSP_SCREEN_HEIGHT);
+	sceGuEnable(GU_SCISSOR_TEST);
+	sceGuDisable(GU_DEPTH_TEST);
+	sceGuDepthMask(GU_TRUE);
+	sceGuDisable(GU_CULL_FACE);
+	sceGuDisable(GU_LIGHTING);
+	sceGuFrontFace(GU_CW);
+	sceGuEnable(GU_TEXTURE_2D);
+	sceGuAmbientColor(0xFFFFFFFF);
+	sceGuColor(0xFFFFFFFF);
+	sceGuTexOffset(0, 0);
+	sceGuTexFilter(GU_LINEAR, GU_LINEAR);
+	sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGBA);
+	sceGuAlphaFunc(GU_GREATER, 0, 0xFF);
+}
+
+void DisplayManager::renderOverlayClients(bool markClean) {
+	prepareOverlayGuState();
+
+	if (_imageViewer->isVisible())
+		_imageViewer->render();
+	if (markClean)
+		_imageViewer->setClean();
+
+	if (_overlay->isVisible())
+		_overlay->render();
+	if (markClean)
+		_overlay->setClean();
+
+	if (_cursor->isVisible())
+		_cursor->render();
+	if (markClean)
+		_cursor->setClean();
+
+	if (_keyboard->isVisible())
+		_keyboard->render();
+	if (markClean)
+		_keyboard->setClean();
+}
+
 // return true if we really rendered or no dirty. False otherwise
 bool DisplayManager::renderAll() {
 	DEBUG_ENTER_FUNC();
@@ -398,6 +755,34 @@ bool DisplayManager::renderAll() {
 		return false;	// didn't render
 	}
 #endif /* USE_DISPLAY_CALLBACK */
+
+	if (_nativeSession.isActive()) {
+		if (_nativeSession.isFrameOpen()) {
+			return true;
+		}
+		if (!hasAnyOverlayVisible()) {
+			_screen->setClean();
+			_imageViewer->setClean();
+			_overlay->setClean();
+			_cursor->setClean();
+			_keyboard->setClean();
+			return true;
+		}
+		if (!_imageViewer->isDirty() &&
+			!_overlay->isDirty() &&
+			!_cursor->isDirty() &&
+			!_keyboard->isDirty()) {
+			return true;
+		}
+		if (!isTimeToUpdate())
+			return false;
+
+		_masterGuRenderer.guPreRender();
+		_screen->setClean();
+		renderOverlayClients(true);
+		_masterGuRenderer.guPostRender();
+		return true;
+	}
 
 	// This is cheaper than checking time, so we do it first
 	// Any one of these being dirty causes everything to draw
@@ -426,21 +811,7 @@ bool DisplayManager::renderAll() {
 	_screen->render();
 	_screen->setClean();				// clean out dirty bit
 
-	if (_imageViewer->isVisible())
-		_imageViewer->render();
-	_imageViewer->setClean();
-
-	if (_overlay->isVisible())
-		_overlay->render();
-	_overlay->setClean();
-
-	if (_cursor->isVisible())
-		_cursor->render();
-	_cursor->setClean();
-
-	if (_keyboard->isVisible())
-		_keyboard->render();
-	_keyboard->setClean();
+	renderOverlayClients(true);
 
 	_masterGuRenderer.guPostRender();
 

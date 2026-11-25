@@ -136,6 +136,7 @@ public:
 	FilesystemFactory *getFilesystemFactory() { return &PSPFilesystemFactory::instance(); }
 	void getTimeAndDate(TimeDate &td, bool skipRecord = false) const;
 	virtual void engineDone();
+	PspGuSession *getNativeGuSession() { return _displayManager.getNativeGuSession(); }
 
 	void quit();
 

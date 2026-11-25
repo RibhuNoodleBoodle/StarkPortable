@@ -338,6 +338,10 @@ void StarkEngine::checkRecommendedDatafiles() {
 }
 
 bool StarkEngine::hasFeature(EngineFeature f) const {
+#if defined(__PSP__)
+	// PSP uses fixed native sceGu output mapped from the logical 640x480 canvas
+	bool softRenderer = true;
+#else
 	// The TinyGL renderer does not support arbitrary resolutions for now
 	Common::String rendererConfig = ConfMan.get("renderer");
 	Graphics::RendererType desiredRendererType = Graphics::Renderer::parseTypeCode(rendererConfig);
@@ -353,6 +357,7 @@ bool StarkEngine::hasFeature(EngineFeature f) const {
 #endif
 			0);
 	bool softRenderer = matchingRendererType == Graphics::kRendererTypeTinyGL;
+#endif
 
 	return
 		(f == kSupportsLoadingDuringRuntime) ||

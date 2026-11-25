@@ -23,6 +23,7 @@
 #define PSP_DISPLAY_MAN_H
 
 #include "backends/platform/psp/thread.h"
+#include "backends/platform/psp/psp_gu_session.h"
 #include "common/list.h"
 
 #define UNCACHED(x)		((byte *)(((uint32)(x)) | 0x40000000))	/* make an uncached access */
@@ -42,7 +43,6 @@ public:
 			return true;
 		return false;
 	}
-
 
 private:
 	/**
@@ -72,14 +72,22 @@ private:
 class MasterGuRenderer : public PspThreadable {
 public:
 	MasterGuRenderer() : _lastRenderTime(0), _renderFinished(true),
-		_renderSema(1, 1), _callbackId(-1) {}
+		_renderSema(1, 1), _callbackId(-1), _guStarts(0), _guFinishes(0), _guSwaps(0) {}
 	void guInit();
 	void guPreRender();
 	void guPostRender();
 	void guShutDown();
+	void beginNativeFrame(void *displayList);
+	void finishNativeFrame();
+	void getGuCounters(uint32 &starts, uint32 &finishes, uint32 &swaps) const {
+		starts = _guStarts;
+		finishes = _guFinishes;
+		swaps = _guSwaps;
+	}
 	bool isRenderFinished() { return _renderFinished; }
 	void sleepUntilRenderFinished();
 	void setupCallbackThread();
+
 private:
 	virtual void threadFunction();			// for the display callback thread
 	static uint32 _displayList[];
@@ -89,6 +97,9 @@ private:
 	bool _renderFinished;					// for sync with render callback
 	PspSemaphore _renderSema;				// semaphore for syncing
 	int _callbackId;						// to keep track of render callback
+	uint32 _guStarts;
+	uint32 _guFinishes;
+	uint32 _guSwaps;
 };
 
 class Screen;
@@ -136,6 +147,14 @@ public:
 	uint32 getOutputBitsPerPixel() const { return _displayParams.outputBitsPerPixel; }
 	Common::List<Graphics::PixelFormat> getSupportedPixelFormats() const;
 
+	// Native GU scene session bridge (Step 01+)
+	PspGuSession *getNativeGuSession() { return &_nativeSession; }
+	void releaseNativeSessionOnEngineDone();
+	bool hasAnyOverlayVisible() const;
+	void prepareOverlayGuState();
+	void renderOverlayClients(bool markClean);
+	MasterGuRenderer &getMasterGuRenderer() { return _masterGuRenderer; }
+
 private:
 	struct GlobalDisplayParams {
 		Dimensions screenOutput;
@@ -154,6 +173,7 @@ private:
 	ImageViewer *_imageViewer;
 
 	MasterGuRenderer _masterGuRenderer;
+	PspGuSession _nativeSession;
 	uint32 _lastUpdateTime;					// For limiting FPS
 	int _graphicsMode;
 	GlobalDisplayParams _displayParams;

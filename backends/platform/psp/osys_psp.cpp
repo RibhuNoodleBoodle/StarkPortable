@@ -104,6 +104,8 @@ void OSystem_PSP::initBackend() {
 
 // Let's us know an engine
 void OSystem_PSP::engineDone() {
+	// Ensure any active native GU scene session unwinds cleanly on RTL or abnormal exit
+	_displayManager.releaseNativeSessionOnEngineDone();
 	// for now, all we need is to reset the image number on the viewer
 	_imageViewer.resetOnEngineDone();
 }

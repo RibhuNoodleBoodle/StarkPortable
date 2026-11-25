@@ -125,6 +125,7 @@ MODULE_OBJS := \
 	visual/smacker.o \
 	visual/text.o
 
+ifndef PSP
 ifdef USE_TINYGL
 MODULE_OBJS += \
 	gfx/tinygl.o \
@@ -134,6 +135,18 @@ MODULE_OBJS += \
 	gfx/tinyglprop.o \
 	gfx/tinyglsurface.o \
 	gfx/tinygltexture.o
+endif
+endif
+
+ifdef PSP
+MODULE_OBJS += \
+	gfx/pspgu.o \
+	gfx/pspguactor.o \
+	gfx/pspgubitmap.o \
+	gfx/pspgufade.o \
+	gfx/pspguprop.o \
+	gfx/pspgusurface.o \
+	gfx/pspgutexture.o
 endif
 
 # This module can be built as a plugin
