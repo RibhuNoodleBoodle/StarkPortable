@@ -96,6 +96,12 @@ public:
 	void set3DMode() override;
 	bool computeLightsEnabled() override;
 
+	bool supportsNativeEffects() const override { return true; }
+	bool renderEffectQuads(const Common::Point &dest, const Common::Point &bounds,
+	                       const EffectQuad *quads, uint32 count) override;
+	bool renderEffectLines(const Common::Point &dest, const Common::Point &bounds,
+	                       const EffectLine *lines, uint32 count) override;
+
 	PspGuSession *getSession() const { return _session; }
 	bool isSessionReady() const { return _sessionReady; }
 	const Common::Rect &getViewport() const { return _viewport; }
@@ -119,6 +125,8 @@ private:
 	void verifyStartupContracts();
 	bool verifyStep03SurfaceAndTextureContracts(uint32 *readbackBuf, uint32 readbackStride);
 	bool verifyStep04HardwareTLContracts(uint32 *readbackBuf, uint32 readbackStride);
+	bool verifyStep05EffectsParityContracts(uint32 *readbackBuf, uint32 readbackStride);
+	bool applyEffectOverlayState(const Common::Point &dest, const Common::Point &bounds) const;
 
 	PspGuSession *_session;
 	Common::Rect _viewport;

@@ -92,7 +92,7 @@ void PspGuFadeRenderer::render(float fadeVal) {
 	sceGuDisable(GU_CULL_FACE);
 	sceGuDisable(GU_ALPHA_TEST);
 	sceGuDisable(GU_STENCIL_TEST);
-	sceGuPixelMask(0x00000000);
+	sceGuPixelMask(0xFF000000u);
 	sceGuEnable(GU_BLEND);
 	sceGuBlendFunc(GU_ADD, GU_FIX, GU_ONE_MINUS_SRC_ALPHA, 0x00FFFFFF, 0);
 	sceGuDrawArray(GU_SPRITES, GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_2D, 2, nullptr, verts);

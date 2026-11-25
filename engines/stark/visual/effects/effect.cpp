@@ -35,15 +35,20 @@ VisualEffect::VisualEffect(VisualType type, const Common::Point &size, Gfx::Driv
 		Visual(type),
 		_size(size),
 		_gfx(gfx),
+		_surfaceRenderer(nullptr),
+		_bitmap(nullptr),
+		_surface(nullptr),
 		_timeBetweenTwoUpdates(3 * 33), // ms (frames @ 30 fps)
 		_timeRemainingUntilNextUpdate(0) {
-	_surface = new Graphics::Surface();
-	_surface->create(size.x, size.y, Gfx::Driver::getRGBAPixelFormat());
+	if (_gfx && !_gfx->supportsNativeEffects()) {
+		_surface = new Graphics::Surface();
+		_surface->create(size.x, size.y, Gfx::Driver::getRGBAPixelFormat());
 
-	_bitmap = _gfx->createBitmap(_surface);
-	_bitmap->setSamplingFilter(StarkSettings->getImageSamplingFilter());
+		_bitmap = _gfx->createBitmap(_surface);
+		_bitmap->setSamplingFilter(StarkSettings->getImageSamplingFilter());
 
-	_surfaceRenderer = _gfx->createSurfaceRenderer();
+		_surfaceRenderer = _gfx->createSurfaceRenderer();
+	}
 }
 
 VisualEffect::~VisualEffect() {

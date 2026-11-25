@@ -42,6 +42,10 @@
 #include "engines/stark/gfx/pspguprop.h"
 #include "engines/stark/gfx/pspgusurface.h"
 #include "engines/stark/gfx/pspgutexture.h"
+#include "engines/stark/visual/effects/bubbles.h"
+#include "engines/stark/visual/effects/fireflies.h"
+#include "engines/stark/visual/effects/fish.h"
+#include "engines/stark/visual/explodingimage.h"
 
 #include "common/debug.h"
 #include "common/endian.h"
@@ -1275,6 +1279,225 @@ bool PspGuDriver::verifyStep04HardwareTLContracts(uint32 *readbackBuf, uint32 re
 	       cpuOverflowPass && skin2BonePass && propSplitPass && zeroLeakPass;
 }
 
+bool PspGuDriver::verifyStep05EffectsParityContracts(uint32 *readbackBuf, uint32 readbackStride) {
+	if (!readbackBuf) {
+		return false;
+	}
+
+	const uint32 liveBmpBefore = s_liveBitmapBytes;
+	const uint32 liveAuxBefore = s_liveAuxBytes;
+
+	bool shadowSinglePass = false;
+	bool multiCasterPass = false;
+	bool depthOcclPass = false;
+	bool alphaIsoPass = false;
+	bool effectsQuadsPass = false;
+	bool effectsLinesPass = false;
+	bool stateIsoPass = false;
+	bool noCpuSurfacePass = false;
+
+	// 1. Non-shadow alpha isolation + planar stencil shadow overlap + multi-caster + depth occlusion
+	{
+		setScreenViewport(false);
+		clearScreen();
+
+		PspGuSurfaceRenderer *sr = new PspGuSurfaceRenderer(this);
+		// Background floor in steel blue (100, 140, 180); pixel mask keeps alpha/stencil at 0
+		sr->fill(Color(100, 140, 180, 255), Common::Point(0, 0), kOriginalWidth, kOriginalHeight);
+
+		set3DMode();
+		sceGuDisable(GU_TEXTURE_2D);
+		Math::Matrix4 idMat;
+		idMat.setToIdentity();
+		pspGuLoadMatrix4(GU_PROJECTION, idMat);
+		pspGuLoadMatrix4(GU_VIEW, idMat);
+		pspGuLoadMatrix4(GU_MODEL, idMat);
+
+		struct Vert3D {
+			uint32 color;
+			float x, y, z;
+		};
+
+		// Foreground blocker at right side with closer depth (reverseDepth=true -> z_ndc=-0.5 maps to closer depth than 0.0)
+		Vert3D *blocker = static_cast<Vert3D *>(_session->allocVertices(4 * sizeof(Vert3D), 16));
+		if (blocker) {
+			blocker[0] = { 0xFF2828DCu, 0.25f, -0.4f, -0.5f };
+			blocker[1] = { 0xFF2828DCu, 0.75f, -0.4f, -0.5f };
+			blocker[2] = { 0xFF2828DCu, 0.25f,  0.4f, -0.5f };
+			blocker[3] = { 0xFF2828DCu, 0.75f,  0.4f, -0.5f };
+			_session->flushDataRange(blocker, 4 * sizeof(Vert3D));
+			sceGumDrawArray(GU_TRIANGLE_STRIP, GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_3D, 4, nullptr, blocker);
+		}
+
+		// Overlapping shadow quads from Caster 1 + Caster 2 at z_ndc=0.0 (behind blocker, on floor)
+		sceGuDepthMask(GU_TRUE);
+		sceGuEnable(GU_BLEND);
+		sceGuBlendFunc(GU_ADD, GU_SRC_ALPHA, GU_ONE_MINUS_SRC_ALPHA, 0, 0);
+		sceGuEnable(GU_STENCIL_TEST);
+		sceGuStencilFunc(GU_EQUAL, 0, 0xFF);
+		sceGuStencilOp(GU_KEEP, GU_KEEP, GU_INCR);
+		sceGuPixelMask(0x00000000u);
+
+		Vert3D *shVerts = static_cast<Vert3D *>(_session->allocVertices(12 * sizeof(Vert3D), 16));
+		if (shVerts) {
+			shVerts[0]  = { 0x80000000u, -0.6f, -0.5f, 0.0f };
+			shVerts[1]  = { 0x80000000u,  0.6f, -0.5f, 0.0f };
+			shVerts[2]  = { 0x80000000u, -0.6f,  0.5f, 0.0f };
+			shVerts[3]  = { 0x80000000u,  0.6f, -0.5f, 0.0f };
+			shVerts[4]  = { 0x80000000u,  0.6f,  0.5f, 0.0f };
+			shVerts[5]  = { 0x80000000u, -0.6f,  0.5f, 0.0f };
+			shVerts[6]  = { 0x80000000u, -0.4f, -0.4f, 0.0f };
+			shVerts[7]  = { 0x80000000u,  0.4f, -0.4f, 0.0f };
+			shVerts[8]  = { 0x80000000u,  0.0f,  0.4f, 0.0f };
+			shVerts[9]  = { 0x80000000u, -0.2f, -0.3f, 0.0f };
+			shVerts[10] = { 0x80000000u,  0.8f, -0.3f, 0.0f };
+			shVerts[11] = { 0x80000000u,  0.3f,  0.6f, 0.0f };
+			_session->flushDataRange(shVerts, 12 * sizeof(Vert3D));
+			sceGumDrawArray(GU_TRIANGLES, GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_3D, 9, nullptr, shVerts);
+			sceGumDrawArray(GU_TRIANGLES, GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_3D, 3, nullptr, shVerts + 9);
+		}
+		sceGuPixelMask(0xFF000000u);
+		sceGuDisable(GU_STENCIL_TEST);
+		sceGuDisable(GU_BLEND);
+		sceGuDepthMask(GU_FALSE);
+
+		_session->flushSceneSegment();
+		const bool readOk = _session->readSceneRectToRam(0, 0, 320, 240, readbackBuf, readbackStride);
+		_session->resumeSceneSegment();
+		delete sr;
+
+		if (readOk) {
+			auto sampleNdc = [&](float nx, float ny) -> uint32 {
+				const int32 px = CLIP<int32>(_rtViewport.left + (int32)((nx * 0.5f + 0.5f) * (float)_rtViewport.width()), 0, 319);
+				const int32 py = CLIP<int32>(_rtViewport.top + (int32)((1.0f - (ny * 0.5f + 0.5f)) * (float)_rtViewport.height()), 0, 239);
+				return readbackBuf[py * readbackStride + px];
+			};
+			const uint32 pxBg = sampleNdc(-0.85f, 0.0f);
+			const uint32 pxSingleOverlap = sampleNdc(0.0f, -0.1f);
+			const uint32 pxMultiCaster = sampleNdc(0.10f, 0.05f);
+			const uint32 pxBlocker = sampleNdc(0.50f, 0.0f);
+
+			const int bgR = (int)(pxBg & 0xFFu);
+			const int shR = (int)(pxSingleOverlap & 0xFFu);
+			const int shG = (int)((pxSingleOverlap >> 8) & 0xFFu);
+			const int mcR = (int)(pxMultiCaster & 0xFFu);
+			const int blR = (int)(pxBlocker & 0xFFu);
+
+			alphaIsoPass = (bgR >= 95 && bgR <= 105);
+			shadowSinglePass = (shR >= 44 && shR <= 58) && (shG >= 62 && shG <= 80);
+			multiCasterPass = (mcR >= 44 && mcR <= 58);
+			depthOcclPass = (blR >= 210);
+			if (!alphaIsoPass || !shadowSinglePass || !multiCasterPass || !depthOcclPass) {
+				debug("[STARK-PSP-STEP05] shadow probe: bg=0x%08x single=0x%08x multi=0x%08x block=0x%08x",
+				      pxBg, pxSingleOverlap, pxMultiCaster, pxBlocker);
+			}
+		}
+	}
+
+	// 2. Native GE procedural effects (dots, crosses, lines) + zero CPU surface allocation + pass-state isolation
+	{
+		setScreenViewport(false);
+		clearScreen();
+
+		VisualEffectBubbles *bub = new VisualEffectBubbles(this, Common::Point(120, 120));
+		VisualEffectFireFlies *ff = new VisualEffectFireFlies(this, Common::Point(120, 120));
+		VisualEffectFish *fish = new VisualEffectFish(this, Common::Point(120, 120));
+		noCpuSurfacePass = (s_liveBitmapBytes == liveBmpBefore);
+		delete fish;
+		delete ff;
+		delete bub;
+
+		const EffectQuad quads[] = {
+			{ 10.0f, 10.0f, 11.0f, 11.0f, 0xFF00FF00u, true },
+			{ 29.0f, 20.0f, 32.0f, 21.0f, 0xFF404040u, true },
+			{ 30.0f, 19.0f, 31.0f, 22.0f, 0xFF404040u, true },
+			{ 30.0f, 20.0f, 31.0f, 21.0f, 0xFFFFFFFFu, true },
+			{ 150.0f, 20.0f, 152.0f, 22.0f, 0xFF0000FFu, true }
+		};
+		const EffectLine lines[] = {
+			{ 10.0f, 70.0f, 90.0f, 100.0f, 0xFFFF8800u }
+		};
+
+		const bool qOk = renderEffectQuads(Common::Point(100, 100), Common::Point(120, 120), quads, 5);
+		const bool lOk = renderEffectLines(Common::Point(100, 100), Common::Point(120, 120), lines, 1);
+
+		PspGuSurfaceRenderer *sr = new PspGuSurfaceRenderer(this);
+		sr->setFadeLevel(-0.25f);
+		sr->fill(Color(200, 200, 200, 255), Common::Point(400, 100), 64, 64);
+		delete sr;
+
+		_session->flushSceneSegment();
+		const bool readOk = _session->readSceneRectToRam(0, 0, 320, 240, readbackBuf, readbackStride);
+		_session->resumeSceneSegment();
+
+		if (readOk) {
+			float rtDotX = 0.0f, rtDotY = 0.0f, rtClipX = 0.0f, rtClipY = 0.0f, rtCrossX = 0.0f, rtCrossY = 0.0f;
+			float rtMidLineX = 0.0f, rtMidLineY = 0.0f, rtFillX = 0.0f, rtFillY = 0.0f;
+			mapLogical2DToRt(110.5f, 110.5f, rtDotX, rtDotY);
+			mapLogical2DToRt(250.5f, 120.5f, rtClipX, rtClipY);
+			mapLogical2DToRt(130.5f, 120.5f, rtCrossX, rtCrossY);
+			mapLogical2DToRt(150.0f, 185.0f, rtMidLineX, rtMidLineY);
+			mapLogical2DToRt(432.0f, 132.0f, rtFillX, rtFillY);
+
+			auto sampleNear = [&](int32 cx, int32 cy, uint32 mask, uint32 minVal) -> bool {
+				for (int32 dy = -2; dy <= 2; ++dy) {
+					for (int32 dx = -2; dx <= 2; ++dx) {
+						const int32 px = CLIP<int32>(cx + dx, 0, 319);
+						const int32 py = CLIP<int32>(cy + dy, 0, 239);
+						if ((readbackBuf[py * readbackStride + px] & mask) >= minVal) {
+							return true;
+						}
+					}
+				}
+				return false;
+			};
+
+			const bool dotDrawn = sampleNear((int32)floorf(rtDotX), (int32)floorf(rtDotY), 0x0000FF00u, 0x0000C000u);
+			const bool crossDrawn = sampleNear((int32)floorf(rtCrossX), (int32)floorf(rtCrossY), 0x00FFFFFFu, 0x00F0F0F0u);
+			const uint32 clipPx = readbackBuf[CLIP<int32>((int32)floorf(rtClipY), 0, 239) * readbackStride +
+			                                  CLIP<int32>((int32)floorf(rtClipX), 0, 319)];
+			effectsQuadsPass = qOk && dotDrawn && crossDrawn && ((clipPx & 0x00FFFFFFu) == 0u);
+			effectsLinesPass = lOk && sampleNear((int32)floorf(rtMidLineX), (int32)floorf(rtMidLineY), 0x00FF0000u, 0x00800000u);
+
+			const uint32 fillPx = readbackBuf[CLIP<int32>((int32)floorf(rtFillY), 0, 239) * readbackStride +
+			                                  CLIP<int32>((int32)floorf(rtFillX), 0, 319)];
+			const int fR = (int)(fillPx & 0xFFu);
+			stateIsoPass = (fR >= 120 && fR <= 150);
+		}
+	}
+
+	const bool zeroLeakPass = (s_liveBitmapBytes == liveBmpBefore) && (s_liveAuxBytes == liveAuxBefore);
+
+	if (ensureFrameBegun()) {
+		setScreenViewport(false);
+		sceGuDisable(GU_TEXTURE_2D);
+		sceGuDisable(GU_BLEND);
+		sceGuDisable(GU_STENCIL_TEST);
+		sceGuDisable(GU_LIGHTING);
+		sceGuDisable(GU_CLIP_PLANES);
+		pspGuDisableAllLights();
+		clearScreen();
+	}
+	_session->submitFrame(false);
+	_session->waitFrame();
+
+	debug("[STARK-PSP-STEP05] contracts: shadowSingle=%s multiCaster=%s depthOccl=%s alphaIso=%s "
+	      "noCpuSurf=%s fxQuads=%s fxLines=%s stateIso=%s zeroLeak=%s liveBmp=%u liveAux=%u",
+	      shadowSinglePass ? "OK" : "FAIL",
+	      multiCasterPass ? "OK" : "FAIL",
+	      depthOcclPass ? "OK" : "FAIL",
+	      alphaIsoPass ? "OK" : "FAIL",
+	      noCpuSurfacePass ? "OK" : "FAIL",
+	      effectsQuadsPass ? "OK" : "FAIL",
+	      effectsLinesPass ? "OK" : "FAIL",
+	      stateIsoPass ? "OK" : "FAIL",
+	      zeroLeakPass ? "OK" : "FAIL",
+	      s_liveBitmapBytes, s_liveAuxBytes);
+
+	return shadowSinglePass && multiCasterPass && depthOcclPass && alphaIsoPass &&
+	       noCpuSurfacePass && effectsQuadsPass && effectsLinesPass && stateIsoPass && zeroLeakPass;
+}
+
 void PspGuDriver::verifyStartupContracts() {
 	if (!_session) {
 		return;
@@ -1456,6 +1679,7 @@ void PspGuDriver::verifyStartupContracts() {
 
 		verifyStep03SurfaceAndTextureContracts(readbackBuf, readbackStride);
 		verifyStep04HardwareTLContracts(readbackBuf, readbackStride);
+		verifyStep05EffectsParityContracts(readbackBuf, readbackStride);
 	}
 	free(readbackBuf);
 
@@ -1582,8 +1806,9 @@ void PspGuDriver::clearScreen() {
 	}
 	applySceneViewport();
 	applyDepthConfig(_reverseDepth);
-	sceGuClearColor(0xFF000000);
-	sceGuClear(GU_COLOR_BUFFER_BIT | GU_DEPTH_BUFFER_BIT);
+	sceGuClearColor(0x00000000u);
+	sceGuClearStencil(0);
+	sceGuClear(GU_COLOR_BUFFER_BIT | GU_STENCIL_BUFFER_BIT | GU_DEPTH_BUFFER_BIT);
 }
 
 void PspGuDriver::flipBuffer() {
@@ -1672,7 +1897,9 @@ Graphics::Surface *PspGuDriver::getViewportScreenshot(uint w, uint h) const {
 				for (int32 y = 0; y < rh; ++y) {
 					const uint32 *srcRow = stage + y * dstStride + xSkip;
 					uint32 *dstRow = static_cast<uint32 *>(tmp.getBasePtr(0, y));
-					memcpy(dstRow, srcRow, (size_t)rw * sizeof(uint32));
+					for (int32 x = 0; x < rw; ++x) {
+						dstRow[x] = srcRow[x] | 0xFF000000u;
+					}
 				}
 				result = tmp.scale(w, h, false);
 			}
@@ -1709,8 +1936,124 @@ void PspGuDriver::set3DMode() {
 		pspGuDisableAllLights();
 		sceGuShadeModel(GU_SMOOTH);
 		sceGuSpecular(0.0f);
-		sceGuPixelMask(0x00000000);
+		sceGuPixelMask(0xFF000000u);
 	}
+}
+
+bool PspGuDriver::applyEffectOverlayState(const Common::Point &dest, const Common::Point &bounds) const {
+	applySceneViewport();
+	float bx0 = 0.0f, by0 = 0.0f, bx1 = 0.0f, by1 = 0.0f;
+	mapLogical2DRectToRt(dest.x, dest.y, (uint32)MAX<int32>(0, bounds.x), (uint32)MAX<int32>(0, bounds.y),
+	                     false, false, bx0, by0, bx1, by1);
+	const int32 scL = MAX<int32>(_rtViewport.left, (int32)floorf(bx0));
+	const int32 scT = MAX<int32>(_rtViewport.top, (int32)floorf(by0));
+	const int32 scR = MIN<int32>(_rtViewport.right, (int32)ceilf(bx1));
+	const int32 scB = MIN<int32>(_rtViewport.bottom, (int32)ceilf(by1));
+	if (scR <= scL || scB <= scT) {
+		return false;
+	}
+	sceGuScissor(scL, scT, scR - scL, scB - scT);
+	sceGuEnable(GU_SCISSOR_TEST);
+	sceGuDisable(GU_TEXTURE_2D);
+	sceGuDisable(GU_DEPTH_TEST);
+	sceGuDepthMask(GU_TRUE);
+	sceGuDisable(GU_LIGHTING);
+	pspGuDisableAllLights();
+	sceGuDisable(GU_CLIP_PLANES);
+	sceGuDisable(GU_CULL_FACE);
+	sceGuDisable(GU_ALPHA_TEST);
+	sceGuDisable(GU_STENCIL_TEST);
+	sceGuPixelMask(0xFF000000u);
+	sceGuEnable(GU_BLEND);
+	sceGuBlendFunc(GU_ADD, GU_FIX, GU_ONE_MINUS_SRC_ALPHA, 0x00FFFFFF, 0);
+	return true;
+}
+
+bool PspGuDriver::renderEffectQuads(const Common::Point &dest, const Common::Point &bounds,
+                                    const EffectQuad *quads, uint32 count) {
+	if (!quads || count == 0 || bounds.x <= 0 || bounds.y <= 0 || !ensureFrameBegun()) {
+		return count == 0;
+	}
+	PspGuSession *session = _session;
+	if (!session) {
+		return false;
+	}
+	if (!applyEffectOverlayState(dest, bounds)) {
+		return true;
+	}
+
+	static const uint32 kChunkQuads = 1024;
+	uint32 offset = 0;
+	while (offset < count) {
+		const uint32 chunk = MIN<uint32>(count - offset, kChunkQuads);
+		if (!session->hasDisplayListHeadroom(128)) {
+			break;
+		}
+		ColorVertex2D *verts = static_cast<ColorVertex2D *>(session->allocVertices(chunk * 2 * sizeof(ColorVertex2D), 16));
+		if (!verts) {
+			break;
+		}
+		for (uint32 i = 0; i < chunk; ++i) {
+			const EffectQuad &q = quads[offset + i];
+			float rx0 = 0.0f, ry0 = 0.0f, rx1 = 0.0f, ry1 = 0.0f;
+			if (q.snapRt1px) {
+				const float lcx = (float)dest.x + 0.5f * (q.x0 + q.x1);
+				const float lcy = (float)dest.y + 0.5f * (q.y0 + q.y1);
+				float rcx = 0.0f, rcy = 0.0f;
+				mapLogical2DToRt(lcx, lcy, rcx, rcy);
+				const float px = floorf(rcx);
+				const float py = floorf(rcy);
+				const float halfW = ((q.x1 - q.x0) > 1.5f) ? 1.5f : 0.5f;
+				const float halfH = ((q.y1 - q.y0) > 1.5f) ? 1.5f : 0.5f;
+				rx0 = px + 0.5f - halfW;
+				ry0 = py + 0.5f - halfH;
+				rx1 = px + 0.5f + halfW;
+				ry1 = py + 0.5f + halfH;
+			} else {
+				mapLogical2DToRt((float)dest.x + q.x0, (float)dest.y + q.y0, rx0, ry0);
+				mapLogical2DToRt((float)dest.x + q.x1, (float)dest.y + q.y1, rx1, ry1);
+			}
+			verts[i * 2 + 0] = { q.abgr, rx0, ry0, 0.0f };
+			verts[i * 2 + 1] = { q.abgr, rx1, ry1, 0.0f };
+		}
+		session->flushDataRange(verts, chunk * 2 * sizeof(ColorVertex2D));
+		sceGuDrawArray(GU_SPRITES, GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_2D, (int)(chunk * 2), nullptr, verts);
+		offset += chunk;
+	}
+
+	applySceneViewport();
+	return true;
+}
+
+bool PspGuDriver::renderEffectLines(const Common::Point &dest, const Common::Point &bounds,
+                                    const EffectLine *lines, uint32 count) {
+	if (!lines || count == 0 || bounds.x <= 0 || bounds.y <= 0 || !ensureFrameBegun()) {
+		return count == 0;
+	}
+	PspGuSession *session = _session;
+	if (!session || !session->hasDisplayListHeadroom(128)) {
+		return false;
+	}
+	if (!applyEffectOverlayState(dest, bounds)) {
+		return true;
+	}
+
+	ColorVertex2D *verts = static_cast<ColorVertex2D *>(session->allocVertices(count * 2 * sizeof(ColorVertex2D), 16));
+	if (verts) {
+		for (uint32 i = 0; i < count; ++i) {
+			const EffectLine &ln = lines[i];
+			float rx0 = 0.0f, ry0 = 0.0f, rx1 = 0.0f, ry1 = 0.0f;
+			mapLogical2DToRt((float)dest.x + ln.x0 + 0.5f, (float)dest.y + ln.y0 + 0.5f, rx0, ry0);
+			mapLogical2DToRt((float)dest.x + ln.x1 + 0.5f, (float)dest.y + ln.y1 + 0.5f, rx1, ry1);
+			verts[i * 2 + 0] = { ln.abgr, rx0, ry0, 0.0f };
+			verts[i * 2 + 1] = { ln.abgr, rx1, ry1, 0.0f };
+		}
+		session->flushDataRange(verts, count * 2 * sizeof(ColorVertex2D));
+		sceGuDrawArray(GU_LINES, GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_2D, (int)(count * 2), nullptr, verts);
+	}
+
+	applySceneViewport();
+	return verts != nullptr;
 }
 
 bool PspGuDriver::computeLightsEnabled() {

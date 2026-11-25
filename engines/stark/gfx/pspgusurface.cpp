@@ -66,7 +66,7 @@ void PspGuSurfaceRenderer::prepare2DState() const {
 	sceGuDisable(GU_CULL_FACE);
 	sceGuDisable(GU_ALPHA_TEST);
 	sceGuDisable(GU_STENCIL_TEST);
-	sceGuPixelMask(0x00000000);
+	sceGuPixelMask(0xFF000000u);
 	sceGuEnable(GU_BLEND);
 	sceGuBlendFunc(GU_ADD, GU_FIX, GU_ONE_MINUS_SRC_ALPHA, 0x00FFFFFF, 0);
 }
@@ -236,7 +236,7 @@ void PspGuSurfaceRenderer::render(const Bitmap *bitmap, const Common::Point &des
 				sceGuBlendFunc(_fadeLevel >= 0.0f ? GU_ADD : GU_REVERSE_SUBTRACT, GU_SRC_ALPHA, GU_FIX, 0, 0x00FFFFFF);
 				sceGuDrawArray(GU_SPRITES, GU_TEXTURE_32BITF | GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_2D, 2, nullptr, fVerts);
 
-				sceGuPixelMask(0x00000000u);
+				sceGuPixelMask(0xFF000000u);
 				sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGBA);
 				sceGuBlendFunc(GU_ADD, GU_FIX, GU_ONE_MINUS_SRC_ALPHA, 0x00FFFFFF, 0);
 			}

@@ -40,7 +40,9 @@ VisualExplodingImage::VisualExplodingImage(Gfx::Driver *gfx) :
 		_bitmap(nullptr),
 		_surface(nullptr),
 		_originalWidth(0),
-		_originalHeight(0) {
+		_originalHeight(0),
+		_srcWidth(0),
+		_srcHeight(0) {
 	_surfaceRenderer = _gfx->createSurfaceRenderer();
 }
 
@@ -56,33 +58,86 @@ VisualExplodingImage::~VisualExplodingImage() {
 void VisualExplodingImage::initFromSurface(const Graphics::Surface *surface, uint originalWidth, uint originalHeight) {
 	assert(!_surface && !_bitmap);
 
-	_surface = new Graphics::Surface();
-	_surface->copyFrom(*surface);
 	_originalWidth  = originalWidth;
 	_originalHeight = originalHeight;
+	_srcWidth = surface->w;
+	_srcHeight = surface->h;
+	_srcFormat = surface->format;
 
-	_bitmap = _gfx->createBitmap(_surface);
-	_bitmap->setSamplingFilter(StarkSettings->getImageSamplingFilter());
+	if (_gfx->supportsNativeEffects()) {
+		_bitmap = _gfx->createBitmap(surface);
+		_bitmap->setSamplingFilter(StarkSettings->getImageSamplingFilter());
+	} else {
+		_surface = new Graphics::Surface();
+		_surface->copyFrom(*surface);
+		_bitmap = _gfx->createBitmap(_surface);
+		_bitmap->setSamplingFilter(StarkSettings->getImageSamplingFilter());
+	}
 
 	// Create an explosion unit for each pixel in the surface
-	_units.resize(_surface->w * _surface->h);
+	_units.resize(_srcWidth * _srcHeight);
 
-	Common::Point explosionCenter(_surface->w / 2, _surface->h / 2);
+	Common::Point explosionCenter(_srcWidth / 2, _srcHeight / 2);
 	Common::Point explosionAmplitude(48, 16);
-	explosionAmplitude.x *= _surface->w / (float)originalWidth;
-	explosionAmplitude.y *= _surface->h / (float)originalHeight;
+	explosionAmplitude.x *= _srcWidth / (float)originalWidth;
+	explosionAmplitude.y *= _srcHeight / (float)originalHeight;
 
 	uint index = 0;
-	for (int y = 0; y < _surface->h; y++) {
-		for (int x = 0; x < _surface->w; x++, index++) {
+	for (uint y = 0; y < _srcHeight; y++) {
+		for (uint x = 0; x < _srcWidth; x++, index++) {
 			_units[index].setPosition(x, y);
-			_units[index].setExplosionSettings(explosionCenter, explosionAmplitude, _surface->w / (float)originalWidth);
-			_units[index].setColor(*static_cast<uint32 *>(_surface->getBasePtr(x, y)), _surface->format);
+			_units[index].setExplosionSettings(explosionCenter, explosionAmplitude, _srcWidth / (float)originalWidth);
+			_units[index].setColor(*static_cast<const uint32 *>(surface->getBasePtr(x, y)), surface->format);
 		}
 	}
 }
 
 void VisualExplodingImage::render(const Common::Point &position) {
+	if (_gfx->supportsNativeEffects()) {
+		bool stillActive = true;
+		for (uint i = 0; i < _units.size(); i++) {
+			_units[i].update();
+			if (_units[i]._stillImageTimeRemaining <= 0) {
+				stillActive = false;
+			}
+		}
+		if (stillActive) {
+			_surfaceRenderer->render(_bitmap, position, _originalWidth, _originalHeight);
+			return;
+		}
+
+		Common::Array<Gfx::Driver::EffectQuad> quads;
+		const float invScaleX = _srcWidth > 0 ? (_originalWidth / (float)_srcWidth) : 1.0f;
+		const float invScaleY = _srcHeight > 0 ? (_originalHeight / (float)_srcHeight) : 1.0f;
+		quads.reserve(_units.size());
+		for (uint i = 0; i < _units.size(); i++) {
+			const ExplosionUnit &u = _units[i];
+			if (u._position.getX() <= 1.f || u._position.getX() >= _srcWidth - 1 ||
+			    u._position.getY() <= 1.f || u._position.getY() >= _srcHeight - 1) {
+				continue;
+			}
+			if (u._stillImageTimeRemaining <= 0 && u._position.getDistanceTo(u._center) <= 2.f) {
+				continue;
+			}
+			byte a, r, g, b;
+			_srcFormat.colorToARGB(u._mainColor, a, r, g, b);
+			if (a == 0) {
+				continue;
+			}
+			const uint32 abgrMain = ((uint32)a << 24) | ((uint32)b << 16) | ((uint32)g << 8) | (uint32)r;
+			_srcFormat.colorToARGB(u._darkColor, a, r, g, b);
+			const uint32 abgrDark = ((uint32)a << 24) | ((uint32)b << 16) | ((uint32)g << 8) | (uint32)r;
+
+			const float cx = floorf(u._position.getX()) * invScaleX;
+			const float cy = floorf(u._position.getY()) * invScaleY;
+			quads.push_back({ cx - invScaleX, cy, cx + 2.0f * invScaleX, cy + invScaleY, abgrDark, true });
+			quads.push_back({ cx, cy - invScaleY, cx + invScaleX, cy + 2.0f * invScaleY, abgrDark, true });
+			quads.push_back({ cx, cy, cx + invScaleX, cy + invScaleY, abgrMain, true });
+		}
+		_gfx->renderEffectQuads(position, Common::Point(_originalWidth, _originalHeight), quads.begin(), quads.size());
+		return;
+	}
+
 	// Fill with transparent color
 	_surface->fillRect(Common::Rect(_surface->w, _surface->h), 0);
 

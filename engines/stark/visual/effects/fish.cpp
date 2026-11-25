@@ -68,6 +68,34 @@ void VisualEffectFish::render(const Common::Point &position) {
 		_timeRemainingUntilNextUpdate = _timeBetweenTwoUpdates;
 	}
 
+	if (_gfx && _gfx->supportsNativeEffects()) {
+		Common::Array<Gfx::Driver::EffectLine> lines;
+		lines.reserve(_fishList.size());
+		const uint32 abgrMain = 0xFF000000u | ((uint32)_mainColorB << 16) | ((uint32)_mainColorG << 8) | (uint32)_mainColorR;
+		const byte otherR = _mainColorR + (255 - _mainColorR) / 4;
+		const byte otherG = _mainColorG + (255 - _mainColorG) / 4;
+		const byte otherB = _mainColorB + (255 - _mainColorB) / 3;
+		const uint32 abgrOther = 0xFF000000u | ((uint32)otherB << 16) | ((uint32)otherG << 8) | (uint32)otherR;
+
+		for (uint i = 0; i < _fishList.size(); i++) {
+			const Fish &fish = _fishList[i];
+			if (fish.currentPosition.x < 0 || fish.currentPosition.x >= _size.x ||
+			    fish.currentPosition.y < 0 || fish.currentPosition.y >= _size.y ||
+			    fish.previousPosition.x < 0 || fish.previousPosition.x >= _size.x ||
+			    fish.previousPosition.y < 0 || fish.previousPosition.y >= _size.y) {
+				continue;
+			}
+			const int dx = fish.previousPosition.x - fish.currentPosition.x;
+			const int dy = fish.previousPosition.y - fish.currentPosition.y;
+			const uint32 abgr = (dx * dx + dy * dy >= 4) ? abgrMain : abgrOther;
+			lines.push_back({ (float)fish.previousPosition.x, (float)fish.previousPosition.y,
+			                  (float)fish.currentPosition.x,  (float)fish.currentPosition.y, abgr });
+		}
+
+		_gfx->renderEffectLines(position, _size, lines.begin(), lines.size());
+		return;
+	}
+
 	// Fill with transparent color
 	_surface->fillRect(Common::Rect(_surface->w, _surface->h), 0);
 
@@ -126,8 +154,8 @@ void VisualEffectFish::setParams(const Common::String &params) {
 		index++;
 	}
 
-	_mainColor = _surface->format.RGBToColor(_mainColorR, _mainColorG, _mainColorB);
-	_otherColor = _surface->format.RGBToColor(
+	_mainColor = Gfx::Driver::getRGBAPixelFormat().RGBToColor(_mainColorR, _mainColorG, _mainColorB);
+	_otherColor = Gfx::Driver::getRGBAPixelFormat().RGBToColor(
 			_mainColorR + (255 - _mainColorR) / 4,
 			_mainColorG + (255 - _mainColorG) / 4,
 			_mainColorB + (255 - _mainColorB) / 3

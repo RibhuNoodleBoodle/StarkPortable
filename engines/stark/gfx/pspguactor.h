@@ -26,14 +26,17 @@
 #include "common/array.h"
 
 namespace Stark {
+
+class BoneNode;
+
 namespace Gfx {
 
 class PspGuDriver;
 
 /**
  * Native PSP GE 3D actor renderer with static hardware-skinned (<=8 bone)
- * batches for rigid geometry, bind-equivalence audited seam handling, facial
- * texture resolution, and hardware/CPU-fallback lighting.
+ * batches for rigid geometry, bind-equivalence audited seam handling, planar
+ * stencil-masked shadows, facial texture resolution, and hardware/CPU lighting.
  */
 class PspGuActorRenderer : public VisualActor {
 public:
@@ -93,6 +96,12 @@ private:
 	void clearBatches();
 	void buildBatches();
 	void evaluateBindAuditAndSeamSkin(const Common::Array<Math::Matrix4> &boneMats, bool canHwLights);
+	Math::Vector3d computeShadowLightDirection(const Common::Array<Gfx::LightEntry *> &lights,
+	                                           const Math::Vector3d &actorPosition,
+	                                           const Math::Matrix3 &worldToModelRot) const;
+	void renderShadowPass(const Math::Matrix4 &model, const Math::Vector3d &position,
+	                      const Common::Array<Gfx::LightEntry *> &lights,
+	                      const Common::Array<BoneNode *> &bones) const;
 
 	PspGuDriver *_gfx;
 	Common::Array<RigidBatch> _rigidBatches;

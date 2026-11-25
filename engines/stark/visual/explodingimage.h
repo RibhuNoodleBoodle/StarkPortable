@@ -89,6 +89,9 @@ private:
 
 	uint _originalWidth;
 	uint _originalHeight;
+	uint _srcWidth;
+	uint _srcHeight;
+	Graphics::PixelFormat _srcFormat;
 
 	Common::Array<ExplosionUnit> _units;
 };

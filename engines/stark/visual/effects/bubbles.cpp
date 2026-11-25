@@ -63,6 +63,43 @@ void VisualEffectBubbles::render(const Common::Point &position) {
 		_timeRemainingUntilNextUpdate = _timeBetweenTwoUpdates;
 	}
 
+	if (_gfx && _gfx->supportsNativeEffects()) {
+		Common::Array<Gfx::Driver::EffectQuad> quads;
+		quads.reserve(_bubbles.size() * 3);
+		const uint32 abgrMain = 0xFF000000u | ((uint32)_mainColorB << 16) | ((uint32)_mainColorG << 8) | (uint32)_mainColorR;
+		const byte darkR = 3 * (_mainColorR >> 2);
+		const byte darkG = 3 * (_mainColorG >> 2);
+		const byte darkB = 3 * (_mainColorB >> 2);
+		const uint32 abgrDark = 0xFF000000u | ((uint32)darkB << 16) | ((uint32)darkG << 8) | (uint32)darkR;
+
+		for (uint i = 0; i < _bubbles.size(); i++) {
+			const Bubble &bubble = _bubbles[i];
+			if (bubble.position.x == -1 && bubble.position.y == -1) {
+				continue;
+			}
+			const float bx = (float)bubble.position.x;
+			const float by = (float)bubble.position.y;
+			if (bubble.kind == kSmall) {
+				if (bubble.position.x < 0 || bubble.position.x >= _size.x ||
+				    bubble.position.y < 0 || bubble.position.y >= _size.y) {
+					continue;
+				}
+				quads.push_back({ bx, by, bx + 1.0f, by + 1.0f, abgrMain, true });
+			} else {
+				if (bubble.position.x < 1 || bubble.position.x >= _size.x - 1 ||
+				    bubble.position.y < 1 || bubble.position.y >= _size.y - 1) {
+					continue;
+				}
+				quads.push_back({ bx - 1.0f, by, bx + 2.0f, by + 1.0f, abgrDark, true });
+				quads.push_back({ bx, by - 1.0f, bx + 1.0f, by + 2.0f, abgrDark, true });
+				quads.push_back({ bx, by, bx + 1.0f, by + 1.0f, abgrMain, true });
+			}
+		}
+
+		_gfx->renderEffectQuads(position, _size, quads.begin(), quads.size());
+		return;
+	}
+
 	// Fill with transparent color
 	_surface->fillRect(Common::Rect(_surface->w, _surface->h), 0);
 
@@ -125,12 +162,12 @@ void VisualEffectBubbles::setParams(const Common::String &params) {
 	_sourcePosition.x = _size.x * _sourcePositionRatioX / 100;
 	_sourcePosition.y = _size.y;
 
-	_mainColor = _surface->format.RGBToColor(_mainColorR, _mainColorG, _mainColorB);
+	_mainColor = Gfx::Driver::getRGBAPixelFormat().RGBToColor(_mainColorR, _mainColorG, _mainColorB);
 
 	byte darkColorR =  3 * (_mainColorR >> 2);
 	byte darkColorG =  3 * (_mainColorG >> 2);
 	byte darkColorB =  3 * (_mainColorB >> 2);
-	_darkColor = _surface->format.RGBToColor(darkColorR, darkColorG, darkColorB);
+	_darkColor = Gfx::Driver::getRGBAPixelFormat().RGBToColor(darkColorR, darkColorG, darkColorB);
 
 	_bubbles.resize(_bubbleCount);
 	for (uint i = 0; i < _bubbles.size(); i++) {

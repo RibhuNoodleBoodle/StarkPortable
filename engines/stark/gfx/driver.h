@@ -141,6 +141,35 @@ public:
 	virtual void set3DMode() = 0;
 	virtual bool computeLightsEnabled() = 0;
 
+	struct EffectQuad {
+		float x0;
+		float y0;
+		float x1;
+		float y1;
+		uint32 abgr;
+		bool snapRt1px;
+	};
+
+	struct EffectLine {
+		float x0;
+		float y0;
+		float x1;
+		float y1;
+		uint32 abgr;
+	};
+
+	virtual bool supportsNativeEffects() const { return false; }
+	virtual bool renderEffectQuads(const Common::Point &dest, const Common::Point &bounds,
+	                               const EffectQuad *quads, uint32 count) {
+		(void)dest; (void)bounds; (void)quads; (void)count;
+		return false;
+	}
+	virtual bool renderEffectLines(const Common::Point &dest, const Common::Point &bounds,
+	                               const EffectLine *lines, uint32 count) {
+		(void)dest; (void)bounds; (void)lines; (void)count;
+		return false;
+	}
+
 	virtual bool supportsModdedAssets() const { return true; }
 
 	static const int32 kOriginalWidth = 640;

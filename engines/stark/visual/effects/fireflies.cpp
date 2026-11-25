@@ -57,6 +57,27 @@ void VisualEffectFireFlies::render(const Common::Point &position) {
 		_timeRemainingUntilNextUpdate = _timeBetweenTwoUpdates;
 	}
 
+	if (_gfx && _gfx->supportsNativeEffects()) {
+		Common::Array<Gfx::Driver::EffectQuad> quads;
+		quads.reserve(_fireFlies.size());
+		const Graphics::PixelFormat fmt = Gfx::Driver::getRGBAPixelFormat();
+		for (uint i = 0; i < _fireFlies.size(); i++) {
+			const FireFly &fly = _fireFlies[i];
+			if (fly.currentPosition.x < 0 || fly.currentPosition.x >= _size.x ||
+			    fly.currentPosition.y < 0 || fly.currentPosition.y >= _size.y) {
+				continue;
+			}
+			byte a, r, g, b;
+			fmt.colorToARGB(_frames[fly.currentFrame].color, a, r, g, b);
+			const uint32 abgr = ((uint32)a << 24) | ((uint32)b << 16) | ((uint32)g << 8) | (uint32)r;
+			const float fx = (float)fly.currentPosition.x;
+			const float fy = (float)fly.currentPosition.y;
+			quads.push_back({ fx, fy, fx + 1.0f, fy + 1.0f, abgr, true });
+		}
+		_gfx->renderEffectQuads(position, _size, quads.begin(), quads.size());
+		return;
+	}
+
 	// Fill with transparent color
 	_surface->fillRect(Common::Rect(_surface->w, _surface->h), 0);
 
@@ -122,7 +143,7 @@ void VisualEffectFireFlies::setParams(const Common::String &params) {
 		} else {
 			green = _mainColorG;
 		}
-		frame.color = _surface->format.RGBToColor(_mainColorR, green, _mainColorB);
+		frame.color = Gfx::Driver::getRGBAPixelFormat().RGBToColor(_mainColorR, green, _mainColorB);
 	}
 
 	_fireFlies.resize(_fireFlyCount);

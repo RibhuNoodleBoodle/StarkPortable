@@ -31,12 +31,15 @@
 #include <pspgu.h>
 #include <pspgum.h>
 
+#include "backends/platform/psp/psp_gu_session.h"
 #include "common/debug.h"
 #include "common/hashmap.h"
 #include "engines/stark/model/animhandler.h"
 #include "engines/stark/model/model.h"
 #include "engines/stark/scene.h"
 #include "engines/stark/services/services.h"
+#include "engines/stark/services/settings.h"
+#include "math/vector2d.h"
 
 namespace Stark {
 namespace Gfx {
@@ -621,7 +624,203 @@ void PspGuActorRenderer::render(const Math::Vector3d &position, float direction,
 
 	sceGuDisable(GU_LIGHTING);
 	pspGuDisableAllLights();
+
+	if (_castsShadow &&
+	    StarkScene->shouldRenderShadows() &&
+	    StarkSettings->getBoolSetting(Settings::kShadow)) {
+		renderShadowPass(model, position, lights, bones);
+	}
+
 	_lastDrawnFrameSeq = _gfx->getFrameSeq();
+}
+
+Math::Vector3d PspGuActorRenderer::computeShadowLightDirection(const Common::Array<Gfx::LightEntry *> &lights,
+                                                               const Math::Vector3d &actorPosition,
+                                                               const Math::Matrix3 &worldToModelRot) const {
+	Math::Vector3d sumDirection;
+	bool hasLight = false;
+
+	auto addPointContrib = [&](const LightEntry *light, float weight) -> bool {
+		const float distance = light->position.getDistanceTo(actorPosition);
+		if (distance > light->falloffFar) {
+			return false;
+		}
+		float factor = 1.0f;
+		if (distance > light->falloffNear) {
+			factor = (light->falloffFar - light->falloffNear > 1.0f)
+			         ? (1.0f - (distance - light->falloffNear) / (light->falloffFar - light->falloffNear))
+			         : 0.0f;
+		}
+		const float brightness = (light->color.x() + light->color.y() + light->color.z()) / 3.0f;
+		if (factor <= 0.0f || brightness <= 0.0f) {
+			return false;
+		}
+		Math::Vector3d dir = actorPosition - light->position;
+		dir.normalize();
+		sumDirection += dir * (factor * brightness * weight);
+		return true;
+	};
+
+	for (uint32 i = 1; i < lights.size(); ++i) {
+		const LightEntry *light = lights[i];
+		if (!light) {
+			continue;
+		}
+		bool contributes = false;
+		switch (light->type) {
+		case LightEntry::kPoint:
+			contributes = addPointContrib(light, 1.0f);
+			break;
+		case LightEntry::kDirectional: {
+			const float brightness = (light->color.x() + light->color.y() + light->color.z()) / 3.0f;
+			if (brightness > 0.0f) {
+				Math::Vector3d dir = light->direction;
+				dir.normalize();
+				sumDirection += dir * brightness;
+				contributes = true;
+			}
+			break;
+		}
+		case LightEntry::kSpot: {
+			Math::Vector3d lightToActor = actorPosition - light->position;
+			lightToActor.normalize();
+			const float cosAngle = MAX(0.0f, lightToActor.dotProduct(light->direction));
+			const float cone = CLIP((cosAngle - light->innerConeAngle.getCosine()) /
+			                        MAX(0.001f, light->outerConeAngle.getCosine() - light->innerConeAngle.getCosine()),
+			                        0.0f, 1.0f);
+			if (cone > 0.0f) {
+				contributes = addPointContrib(light, cone);
+			}
+			break;
+		}
+		case LightEntry::kAmbient:
+		default:
+			break;
+		}
+		if (contributes) {
+			hasLight = true;
+		}
+	}
+
+	if (hasLight) {
+		Math::Vector2d horiz(sumDirection.x(), sumDirection.y());
+		const float shadowLen = MIN(horiz.getMagnitude(), StarkScene->getMaxShadowLength());
+		horiz.normalize();
+		horiz *= shadowLen;
+		sumDirection.x() = horiz.getX();
+		sumDirection.y() = horiz.getY();
+		sumDirection.z() = -1.0f;
+	} else {
+		sumDirection.x() = 0.0f;
+		sumDirection.y() = 0.0f;
+		sumDirection.z() = -1.0f;
+	}
+
+	return worldToModelRot * sumDirection;
+}
+
+namespace {
+
+struct ShadowVert {
+	uint32 color;
+	float x, y, z;
+};
+
+template <typename PosFn>
+void projectAndDrawShadowBatch(PspGuSession *session, const Math::Vector3d &lightDir, float safeDirY,
+                               uint32 vertexCount, uint32 indexCount, const uint16 *indices, PosFn getModelPos) {
+	if (vertexCount == 0 || indexCount == 0 || !indices || !session->hasDisplayListHeadroom(128)) {
+		return;
+	}
+	ShadowVert *sv = static_cast<ShadowVert *>(session->allocVertices(vertexCount * sizeof(ShadowVert), 16));
+	if (!sv) {
+		return;
+	}
+	for (uint32 vi = 0; vi < vertexCount; ++vi) {
+		const Math::Vector3d mp = getModelPos(vi);
+		const float t = -mp.y() / safeDirY;
+		const Math::Vector3d sp = mp + lightDir * t;
+		sv[vi].color = 0x80000000u;
+		sv[vi].x = sp.x();
+		sv[vi].y = 0.0f;
+		sv[vi].z = sp.z();
+	}
+	session->flushDataRange(sv, vertexCount * sizeof(ShadowVert));
+	sceGumDrawArray(GU_TRIANGLES,
+	                GU_COLOR_8888 | GU_VERTEX_32BITF | GU_INDEX_16BIT | GU_TRANSFORM_3D,
+	                (int)indexCount, indices, sv);
+}
+
+} // namespace
+
+void PspGuActorRenderer::renderShadowPass(const Math::Matrix4 &model, const Math::Vector3d &position,
+                                          const Common::Array<Gfx::LightEntry *> &lights,
+                                          const Common::Array<BoneNode *> &bones) const {
+	PspGuSession *session = _gfx->getSession();
+	if (!session || (_rigidBatches.empty() && _seamBatches.empty())) {
+		return;
+	}
+
+	Math::Matrix4 modelInverse = model;
+	modelInverse.inverse();
+	const Math::Vector3d lightDir = computeShadowLightDirection(lights, position, modelInverse.getRotation());
+	const float safeDirY = (fabsf(lightDir.y()) > 1e-4f) ? lightDir.y() : -1.0f;
+
+	pspGuLoadMatrix4(GU_MODEL, model);
+	sceGuDisable(GU_LIGHTING);
+	pspGuDisableAllLights();
+	sceGuDisable(GU_TEXTURE_2D);
+	sceGuEnable(GU_DEPTH_TEST);
+	sceGuDepthMask(GU_TRUE);
+	sceGuEnable(GU_BLEND);
+	sceGuBlendFunc(GU_ADD, GU_SRC_ALPHA, GU_ONE_MINUS_SRC_ALPHA, 0, 0);
+	sceGuEnable(GU_STENCIL_TEST);
+	sceGuStencilFunc(GU_EQUAL, 0, 0xFF);
+	sceGuStencilOp(GU_KEEP, GU_KEEP, GU_INCR);
+	sceGuPixelMask(0x00000000u);
+
+	for (uint32 bi = 0; bi < _rigidBatches.size(); ++bi) {
+		const RigidBatch &rb = _rigidBatches[bi];
+		const uint32 wf = (rb.boneCount > 1) ? rb.boneCount : 0;
+		projectAndDrawShadowBatch(session, lightDir, safeDirY, rb.vertexCount, rb.indexCount, rb.indices,
+		                          [&](uint32 vi) -> Math::Vector3d {
+			const float *sv = rb.verts + vi * rb.floatStride;
+			uint8 activeSlot = 0;
+			for (uint32 s = 0; s < wf; ++s) {
+				if (sv[s] > 0.5f) {
+					activeSlot = (uint8)s;
+					break;
+				}
+			}
+			const BoneNode *bn = bones[rb.bones[activeSlot]];
+			Math::Vector3d mp(sv[wf + 5], sv[wf + 6], sv[wf + 7]);
+			bn->_animRot.transform(mp);
+			mp += bn->_animPos;
+			return mp;
+		});
+	}
+
+	for (uint32 bi = 0; bi < _seamBatches.size(); ++bi) {
+		const SeamBatch &sb = _seamBatches[bi];
+		projectAndDrawShadowBatch(session, lightDir, safeDirY, sb.vertexCount, sb.indexCount, sb.indices,
+		                          [&](uint32 vi) -> Math::Vector3d {
+			const SeamVertex &sv = sb.srcVerts[vi];
+			const BoneNode *bn1 = bones[sv.bone1];
+			const BoneNode *bn2 = bones[sv.bone2];
+			Math::Vector3d p1(sv.pos1[0], sv.pos1[1], sv.pos1[2]);
+			Math::Vector3d p2(sv.pos2[0], sv.pos2[1], sv.pos2[2]);
+			bn1->_animRot.transform(p1);
+			p1 += bn1->_animPos;
+			bn2->_animRot.transform(p2);
+			p2 += bn2->_animPos;
+			return Math::Vector3d::interpolate(p2, p1, sv.weight);
+		});
+	}
+
+	sceGuPixelMask(0xFF000000u);
+	sceGuDisable(GU_STENCIL_TEST);
+	sceGuDisable(GU_BLEND);
+	sceGuDepthMask(GU_FALSE);
 }
 
 } // End of namespace Gfx
