@@ -35,9 +35,12 @@ struct PspGuSessionStats {
 	uint32 releases;
 	uint32 duplicateAcquireRejects;
 	uint32 allocFailures;
+	uint32 vramFailures;
 	uint32 starts;
 	uint32 finishes;
 	uint32 swaps;
+	uint32 sceneSegments;
+	uint32 lcdPresents;
 	uint32 overlayRePresents;
 	uint32 suspendCount;
 	uint32 resumeCount;
@@ -45,6 +48,13 @@ struct PspGuSessionStats {
 	uint32 peakListBytes;
 	uint32 lastVertexBytes;
 	uint32 peakVertexBytes;
+	uint32 sceneColorOffset;
+	uint32 sceneColorEnd;
+	uint32 sceneDepthOffset;
+	uint32 sceneDepthEnd;
+	uint32 overlayOffset;
+	uint32 overlayEnd;
+	uint32 freeEdramAfterDepth;
 };
 
 /**
@@ -57,25 +67,47 @@ public:
 	static const uint32 kDisplayListReserve = 4096;  // 4 KiB safety reserve before finish
 	static const uint32 kVertexArenaSize = 262144;   // 256 KiB streamed vertex arena
 
+	// Step 02 offscreen eDRAM scene target constants (Memory_Budget.txt)
+	static const uint32 kEdramBase = 0x04000000;
+	static const uint32 kEdramSize = 2097152;
+	static const uint32 kEdramTargetAlign = 8192;
+	static const uint32 kSceneWidth = 320;
+	static const uint32 kSceneHeight = 240;
+	static const uint32 kSceneColorStride = 512;
+	static const uint32 kSceneColorTexHeight = 256;
+	static const uint32 kSceneColorBytes = kSceneColorStride * kSceneColorTexHeight * 4; // 524,288
+	static const uint32 kSceneDepthStride = 320;
+	static const uint32 kSceneDepthBytes = kSceneDepthStride * kSceneHeight * 2;        // 153,600
+
+	static const uint32 kLcdWidth = 480;
+	static const uint32 kLcdHeight = 272;
+	static const uint32 kPresentLeft = 59;
+	static const uint32 kPresentRight = 421; // x = 59..420 inclusive (width 362)
+
 	PspGuSession();
 	~PspGuSession();
 
 	static PspGuSession *getBackendSession();
 	void bindDisplayManager(DisplayManager *displayManager);
 
-	/** Acquire exclusive native scene ownership and allocate bounded GE command/vertex buffers. */
+	/** Acquire exclusive native scene ownership and allocate bounded eDRAM & RAM buffers. */
 	bool acquire(const char *ownerName);
 
-	/** Wait for GE/callback idle, cleanly close any open frame, and free native buffers. */
+	/** Wait for GE/callback idle, cleanly close any open frame, free buffers, restore launcher Screen. */
 	void release();
 
 	bool isActive() const { return _active; }
 	bool isFrameOpen() const { return _frameOpen; }
 	bool isSuspended() const { return _suspended; }
+	bool hasSceneTarget() const { return _sceneColorPtr != 0 && _sceneDepthPtr != 0; }
+	bool hasValidSceneImage() const { return _sceneRendered; }
 	const char *getOwnerName() const { return _ownerName; }
 
-	/** Begin recording a native GU_DIRECT frame after prior callback/GE completion. */
+	/** Begin recording a native GU_DIRECT scene segment into the 320x240 eDRAM target. */
 	bool beginFrame();
+
+	/** Bind the 320x240 RGBA8888 color + 320x240x2 depth eDRAM buffers on the open GU list. */
+	void bindSceneRenderTarget();
 
 	/** Bump-allocate aligned vertices inside the bounded per-frame vertex arena. */
 	void *allocVertices(uint32 bytes, uint32 alignment = 16);
@@ -86,22 +118,47 @@ public:
 	uint32 getDisplayListBytesUsed() const;
 	bool hasDisplayListHeadroom(uint32 neededBytes = 0) const;
 
+	/** Prime unused 512x256 padding texels outside 320x240 with a debug sentinel color. */
+	void primeScenePadding(uint32 sentinelAbgr);
+
+	/** Close the open scene segment (if any) and sync once before sampling or CPU readback. */
+	bool flushSceneSegment();
+
+	/** Resume an interrupted scene segment (e.g. after mid-frame screenshot readback) without swapping. */
+	bool resumeSceneSegment();
+
+	/** Synchronized VRAM->RAM readback of a cropped rectangle from the 320x240 scene target. */
+	bool readSceneRectToRam(int rx, int ry, int rw, int rh, uint32 *dstRam, int dstStride);
+
+	/**
+	 * Emit the LCD presentation sprite drawing visible 320x240 RT onto x=[59,421) y=[0,272)
+	 * into the currently active GU display list (must already have current LCD backbuffer bound).
+	 */
+	bool emitLcdSceneBlitInActiveList();
+
 	/**
 	 * Composite visible backend overlays (dialog overlay, cursor, vkbd, viewer).
-	 * Draws inline when a native frame is open, or runs a standalone overlay pass if idle.
+	 * Draws inline when a native list is open, or runs a standalone overlay pass if idle.
 	 */
 	bool overlayRePresent();
 
-	/** Finish the open frame, optionally compositing overlays, and schedule buffer swap. */
+	/** Finish scene segment, sync once, present 320x240 -> LCD backbuffer, overlay, and swap. */
 	bool submitFrame(bool compositeOverlay = true);
 
 	/** Block until the scheduled frame callback finishes and swaps buffers. */
 	void waitFrame();
 
-	/** Test hook to deterministically trigger an allocation failure on the next acquire(). */
+	/** Test hooks to deterministically trigger RAM or VRAM allocation failure on next acquire(). */
 	void setInjectAllocFail(bool enable) { _injectAllocFail = enable; }
+	void setInjectVramFail(bool enable) { _injectVramFail = enable; }
 
 	const PspGuSessionStats &getStats() const { return _stats; }
+
+	void *getSceneColorCached() const { return _sceneColorPtr; }
+	void *getSceneColorUncached() const;
+	void *getSceneColorRel() const { return _sceneColorRel; }
+	void *getSceneDepthRel() const { return _sceneDepthRel; }
+	void *getCurrentLcdBackRel() const;
 
 	/** Suspendable hooks invoked via PowerManager. */
 	int onSuspend();
@@ -119,17 +176,24 @@ private:
 
 	void freeBuffers();
 	void syncGlobalCounters();
+	void logEdramMap() const;
 
 	DisplayManager *_displayManager;
 	uint8 *_displayList;
 	uint8 *_vertexArena;
+	void *_sceneColorPtr;
+	void *_sceneDepthPtr;
+	void *_sceneColorRel;
+	void *_sceneDepthRel;
 	uint32 _vertexOffset;
 	const char *_ownerName;
 	bool _active;
 	bool _frameOpen;
+	bool _sceneRendered;
 	bool _suspended;
 	bool _suspendRegistered;
 	bool _injectAllocFail;
+	bool _injectVramFail;
 	PspGuSessionStats _stats;
 	SessionSuspendable _suspendable;
 };

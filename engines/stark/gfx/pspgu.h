@@ -59,17 +59,25 @@ public:
 	bool computeLightsEnabled() override;
 
 	bool isSessionReady() const { return _sessionReady; }
+	const Common::Rect &getRtViewport() const { return _rtViewport; }
+	void mapLogical2DToRt(float lx, float ly, float &outX, float &outY) const;
 	void reportUnimplemented(const char *methodName);
 
 private:
 	bool ensureFrameBegun();
-	void drawStep01SmokeScene();
-	void verifyStep01SessionContracts();
+	void updateRtViewport();
+	void applySceneViewport() const;
+	void applyDepthConfig(bool reverseDepth) const;
+	void drawStep02ValidationScene();
+	void verifyStep02Contracts();
 
 	PspGuSession *_session;
 	Common::Rect _viewport;
+	Common::Rect _unscaledViewport;
+	Common::Rect _rtViewport;
 	bool _sessionReady;
 	bool _clearRequested;
+	bool _reverseDepth;
 	uint32 _smokeFrameIndex;
 	uint32 _unimplementedMask;
 };

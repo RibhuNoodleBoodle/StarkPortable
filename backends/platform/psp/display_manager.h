@@ -36,7 +36,11 @@ class VramAllocator : public Common::Singleton<VramAllocator> {
 public:
 	VramAllocator() : _bytesAllocated(0) {}
 	void *allocate(int32 size, bool smallAllocation = false);	// smallAllocation e.g. palettes
+	void *allocateAligned(int32 size, uint32 alignment, bool avoidSmallPool = true, uint32 *outAvailContiguous = 0);
 	void deallocate(void *pointer);
+	bool verifyNoOverlaps(uint32 *outAllocatedBytes = 0, uint32 *outLargestGap = 0) const;
+	bool containsRange(const void *base, uint32 size) const;
+	uint32 getBytesAllocated() const { return _bytesAllocated; }
 
 	static inline bool isAddressInVram(void *address) {
 		if ((uint32)(CACHED(address)) >= VRAM_START_ADDRESS && (uint32)(CACHED(address)) < VRAM_END_ADDRESS)
@@ -51,7 +55,7 @@ private:
 	struct Allocation {
 		byte *address;
 		uint32 size;
-		void *getEnd() { return address + size; }
+		void *getEnd() const { return address + size; }
 		Allocation(void *Address, uint32 Size) : address((byte *)Address), size(Size) {}
 		Allocation() : address(0), size(0) {}
 	};
@@ -72,13 +76,21 @@ private:
 class MasterGuRenderer : public PspThreadable {
 public:
 	MasterGuRenderer() : _lastRenderTime(0), _renderFinished(true),
-		_renderSema(1, 1), _callbackId(-1), _guStarts(0), _guFinishes(0), _guSwaps(0) {}
+		_renderSema(1, 1), _callbackId(-1), _currentLcdDrawBuffer(0),
+		_nativeHoldsSema(false), _guStarts(0), _guFinishes(0), _guSwaps(0) {}
 	void guInit();
 	void guPreRender();
 	void guPostRender();
 	void guShutDown();
-	void beginNativeFrame(void *displayList);
-	void finishNativeFrame();
+	void bindCurrentLcdBackBuffer();
+	void *getCurrentLcdDrawBuffer() const { return _currentLcdDrawBuffer; }
+	void beginSceneSegment(void *displayList);
+	void resumeSceneSegment(void *displayList);
+	void finishSceneSegmentOnly();
+	void beginLcdPresentList(void *displayList);
+	void finishLcdPresentList();
+	void abortSceneSegmentAndReleaseSema();
+	void releaseNativeSemaIfIdle();
 	void getGuCounters(uint32 &starts, uint32 &finishes, uint32 &swaps) const {
 		starts = _guStarts;
 		finishes = _guFinishes;
@@ -97,6 +109,8 @@ private:
 	bool _renderFinished;					// for sync with render callback
 	PspSemaphore _renderSema;				// semaphore for syncing
 	int _callbackId;						// to keep track of render callback
+	void *_currentLcdDrawBuffer;
+	bool _nativeHoldsSema;
 	uint32 _guStarts;
 	uint32 _guFinishes;
 	uint32 _guSwaps;
@@ -150,6 +164,9 @@ public:
 	// Native GU scene session bridge (Step 01+)
 	PspGuSession *getNativeGuSession() { return &_nativeSession; }
 	void releaseNativeSessionOnEngineDone();
+	void releaseScreenBackingForNative();
+	void restoreScreenBackingAfterNative();
+	void getOverlayVramRange(uint32 &offset, uint32 &end) const;
 	bool hasAnyOverlayVisible() const;
 	void prepareOverlayGuState();
 	void renderOverlayClients(bool markClean);

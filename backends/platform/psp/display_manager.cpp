@@ -129,6 +129,123 @@ void VramAllocator::deallocate(void *address) {
 	PSP_DEBUG_PRINT("Address[%p] not allocated.\n", address);
 }
 
+void *VramAllocator::allocateAligned(int32 size, uint32 alignment, bool avoidSmallPool, uint32 *outAvailContiguous) {
+	DEBUG_ENTER_FUNC();
+	if (outAvailContiguous) {
+		*outAvailContiguous = 0;
+	}
+	if (size <= 0) {
+		return NULL;
+	}
+	if (alignment < 16) {
+		alignment = 16;
+	}
+
+	const uint32 limitAddr = avoidSmallPool ? (uint32)VRAM_SMALL_ADDRESS : (uint32)VRAM_END_ADDRESS;
+	uint32 cursor = (uint32)VRAM_START_ADDRESS;
+	uint32 maxAvail = 0;
+
+	Common::List<Allocation>::iterator i = _allocList.begin();
+	for (; i != _allocList.end(); ++i) {
+		const uint32 nodeStart = (uint32)(*i).address;
+		const uint32 nodeEnd = (uint32)(*i).getEnd();
+		const uint32 gapEnd = nodeStart < limitAddr ? nodeStart : limitAddr;
+		if (gapEnd > cursor) {
+			const uint32 aligned = (cursor + alignment - 1) & ~(alignment - 1);
+			if (gapEnd > aligned) {
+				const uint32 avail = gapEnd - aligned;
+				if (avail > maxAvail) {
+					maxAvail = avail;
+				}
+				if (avail >= (uint32)size) {
+					void *ptr = (void *)(uintptr)aligned;
+					_allocList.insert(i, Allocation(ptr, (uint32)size));
+					_bytesAllocated += (uint32)size;
+					if (outAvailContiguous) {
+						*outAvailContiguous = avail;
+					}
+					return ptr;
+				}
+			}
+		}
+		if (nodeEnd > cursor) {
+			cursor = nodeEnd;
+		}
+		if (cursor >= limitAddr) {
+			break;
+		}
+	}
+
+	if (cursor < limitAddr) {
+		const uint32 aligned = (cursor + alignment - 1) & ~(alignment - 1);
+		if (limitAddr > aligned) {
+			const uint32 avail = limitAddr - aligned;
+			if (avail > maxAvail) {
+				maxAvail = avail;
+			}
+			if (avail >= (uint32)size) {
+				void *ptr = (void *)(uintptr)aligned;
+				_allocList.insert(i, Allocation(ptr, (uint32)size));
+				_bytesAllocated += (uint32)size;
+				if (outAvailContiguous) {
+					*outAvailContiguous = avail;
+				}
+				return ptr;
+			}
+		}
+	}
+
+	if (outAvailContiguous) {
+		*outAvailContiguous = maxAvail;
+	}
+	return NULL;
+}
+
+bool VramAllocator::verifyNoOverlaps(uint32 *outAllocatedBytes, uint32 *outLargestGap) const {
+	uint32 prevEnd = (uint32)VRAM_START_ADDRESS;
+	uint32 total = 0;
+	uint32 largestGap = 0;
+
+	for (Common::List<Allocation>::const_iterator i = _allocList.begin(); i != _allocList.end(); ++i) {
+		const uint32 start = (uint32)(*i).address;
+		const uint32 end = (uint32)(*i).getEnd();
+		if (start < (uint32)VRAM_START_ADDRESS || end > (uint32)VRAM_END_ADDRESS || end <= start) {
+			return false;
+		}
+		if (start < prevEnd) {
+			return false;
+		}
+		if (start - prevEnd > largestGap) {
+			largestGap = start - prevEnd;
+		}
+		prevEnd = end;
+		total += (*i).size;
+	}
+	if ((uint32)VRAM_END_ADDRESS - prevEnd > largestGap) {
+		largestGap = (uint32)VRAM_END_ADDRESS - prevEnd;
+	}
+	if (outAllocatedBytes) {
+		*outAllocatedBytes = total;
+	}
+	if (outLargestGap) {
+		*outLargestGap = largestGap;
+	}
+	return total == _bytesAllocated;
+}
+
+bool VramAllocator::containsRange(const void *base, uint32 size) const {
+	const uint32 qStart = (uint32)CACHED(base);
+	const uint32 qEnd = qStart + size;
+	for (Common::List<Allocation>::const_iterator i = _allocList.begin(); i != _allocList.end(); ++i) {
+		const uint32 aStart = (uint32)(*i).address;
+		const uint32 aEnd = (uint32)(*i).getEnd();
+		if (qStart >= aStart && qEnd <= aEnd) {
+			return true;
+		}
+	}
+	return false;
+}
+
 
 // Class MasterGuRenderer ----------------------------------------------
 
@@ -172,7 +289,7 @@ int MasterGuRenderer::guCallback(int, int, void *__this) {
 
 	sceGuSync(0, 0);				// make sure we wait for GU to finish
 	sceDisplayWaitVblankStartCB();	// wait for v-blank without eating main thread cycles
-	sceGuSwapBuffers();				// swap the back and front buffers
+	_this->_currentLcdDrawBuffer = sceGuSwapBuffers();	// swap the back and front buffers
 	_this->_guSwaps++;
 
 	_this->_renderFinished = true;	// Only this thread can set the variable to true
@@ -214,18 +331,25 @@ void MasterGuRenderer::guProgramDisplayBufferSizes() {
 
 	switch (GuRenderer::_displayManager->getOutputBitsPerPixel()) {
 	case 16:
+		_currentLcdDrawBuffer = (void *)0;
 		sceGuDrawBuffer(GU_PSM_4444, (void *)0, PSP_BUFFER_WIDTH);
 		sceGuDispBuffer(PSP_SCREEN_WIDTH, PSP_SCREEN_HEIGHT, (void *)(PSP_FRAME_SIZE * sizeof(uint16)), PSP_BUFFER_WIDTH);
 		sceGuDepthBuffer((void *)(PSP_FRAME_SIZE * sizeof(uint16) * 2), PSP_BUFFER_WIDTH);
 		VramAllocator::instance().allocate(PSP_FRAME_SIZE * sizeof(uint16) * 2);
 		break;
 	case 32:
+		_currentLcdDrawBuffer = (void *)0;
 		sceGuDrawBuffer(GU_PSM_8888, (void *)0, PSP_BUFFER_WIDTH);
 		sceGuDispBuffer(PSP_SCREEN_WIDTH, PSP_SCREEN_HEIGHT, (void *)(PSP_FRAME_SIZE * sizeof(uint32)), PSP_BUFFER_WIDTH);
 		sceGuDepthBuffer((void *)(PSP_FRAME_SIZE * sizeof(uint32) * 2), PSP_BUFFER_WIDTH);
 		VramAllocator::instance().allocate(PSP_FRAME_SIZE * sizeof(uint32) * 2);
 		break;
 	}
+}
+
+void MasterGuRenderer::bindCurrentLcdBackBuffer() {
+	const int psm = (GuRenderer::_displayManager->getOutputBitsPerPixel() == 16) ? GU_PSM_4444 : GU_PSM_8888;
+	sceGuDrawBufferList(psm, _currentLcdDrawBuffer, PSP_BUFFER_WIDTH);
 }
 
 // These are GU commands that should always stay the same
@@ -244,7 +368,14 @@ inline void MasterGuRenderer::guPreRender() {
 
 	_guStarts++;
 	sceGuStart(0, _displayList);
+	bindCurrentLcdBackBuffer();
 
+	sceGuOffset(2048 - (PSP_SCREEN_WIDTH / 2), 2048 - (PSP_SCREEN_HEIGHT / 2));
+	sceGuViewport(2048, 2048, PSP_SCREEN_WIDTH, PSP_SCREEN_HEIGHT);
+	sceGuScissor(0, 0, PSP_SCREEN_WIDTH, PSP_SCREEN_HEIGHT);
+	sceGuEnable(GU_SCISSOR_TEST);
+	sceGuDisable(GU_DEPTH_TEST);
+	sceGuDepthMask(GU_TRUE);
 	sceGuClearColor(0xFF000000);
 	sceGuClear(GU_COLOR_BUFFER_BIT);
 
@@ -283,30 +414,66 @@ inline void MasterGuRenderer::guPostRender() {
 #endif /* ENABLE_RENDER_MEASURE */
 
 	sceDisplayWaitVblankStart();
-	sceGuSwapBuffers();
+	_currentLcdDrawBuffer = sceGuSwapBuffers();
 	_guSwaps++;
 	_renderFinished = true;
 #endif /* !USE_DISPLAY_CALLBACK */
 }
 
-void MasterGuRenderer::beginNativeFrame(void *displayList) {
+void MasterGuRenderer::beginSceneSegment(void *displayList) {
 	DEBUG_ENTER_FUNC();
+	if (!_nativeHoldsSema) {
 #ifdef USE_DISPLAY_CALLBACK
-	sleepUntilRenderFinished();
-	_renderSema.take();
-	_renderFinished = false;
+		sleepUntilRenderFinished();
+		_renderSema.take();
+		_renderFinished = false;
 #endif
-	_guStarts++;
+		_nativeHoldsSema = true;
+	}
 	sceGuStart(GU_DIRECT, displayList);
-	sceGuOffset(2048 - (PSP_SCREEN_WIDTH / 2), 2048 - (PSP_SCREEN_HEIGHT / 2));
-	sceGuViewport(2048, 2048, PSP_SCREEN_WIDTH, PSP_SCREEN_HEIGHT);
-	sceGuScissor(0, 0, PSP_SCREEN_WIDTH, PSP_SCREEN_HEIGHT);
-	sceGuEnable(GU_SCISSOR_TEST);
-	sceGuFrontFace(GU_CW);
 }
 
-void MasterGuRenderer::finishNativeFrame() {
+void MasterGuRenderer::resumeSceneSegment(void *displayList) {
+	DEBUG_ENTER_FUNC();
+	sceGuStart(GU_DIRECT, displayList);
+}
+
+void MasterGuRenderer::finishSceneSegmentOnly() {
+	DEBUG_ENTER_FUNC();
+	sceGuFinish();
+	sceGuSync(0, 0);
+}
+
+void MasterGuRenderer::beginLcdPresentList(void *displayList) {
+	DEBUG_ENTER_FUNC();
+	_guStarts++;
+	sceGuStart(GU_DIRECT, displayList);
+	bindCurrentLcdBackBuffer();
+	sceGuTexFlush();
+}
+
+void MasterGuRenderer::finishLcdPresentList() {
+	_nativeHoldsSema = false;
 	guPostRender();
+}
+
+void MasterGuRenderer::abortSceneSegmentAndReleaseSema() {
+	DEBUG_ENTER_FUNC();
+	sceGuFinish();
+	sceGuSync(0, 0);
+	releaseNativeSemaIfIdle();
+}
+
+void MasterGuRenderer::releaseNativeSemaIfIdle() {
+	if (_nativeHoldsSema) {
+		_nativeHoldsSema = false;
+#ifdef USE_DISPLAY_CALLBACK
+		_renderFinished = true;
+		_renderSema.give();
+#else
+		_renderFinished = true;
+#endif
+	}
 }
 
 void MasterGuRenderer::guShutDown() {
@@ -325,13 +492,19 @@ PspGuSession::PspGuSession() :
 		_displayManager(0),
 		_displayList(0),
 		_vertexArena(0),
+		_sceneColorPtr(0),
+		_sceneDepthPtr(0),
+		_sceneColorRel(0),
+		_sceneDepthRel(0),
 		_vertexOffset(0),
 		_ownerName(0),
 		_active(false),
 		_frameOpen(false),
+		_sceneRendered(false),
 		_suspended(false),
 		_suspendRegistered(false),
 		_injectAllocFail(false),
+		_injectVramFail(false),
 		_suspendable(this) {
 	memset(&_stats, 0, sizeof(_stats));
 }
@@ -346,6 +519,16 @@ void PspGuSession::bindDisplayManager(DisplayManager *displayManager) {
 }
 
 void PspGuSession::freeBuffers() {
+	if (_sceneDepthPtr) {
+		VramAllocator::instance().deallocate(_sceneDepthPtr);
+		_sceneDepthPtr = 0;
+		_sceneDepthRel = 0;
+	}
+	if (_sceneColorPtr) {
+		VramAllocator::instance().deallocate(_sceneColorPtr);
+		_sceneColorPtr = 0;
+		_sceneColorRel = 0;
+	}
 	if (_displayList) {
 		free(_displayList);
 		_displayList = 0;
@@ -355,12 +538,26 @@ void PspGuSession::freeBuffers() {
 		_vertexArena = 0;
 	}
 	_vertexOffset = 0;
+	_sceneRendered = false;
 }
 
 void PspGuSession::syncGlobalCounters() {
 	if (_displayManager) {
 		_displayManager->getMasterGuRenderer().getGuCounters(_stats.starts, _stats.finishes, _stats.swaps);
 	}
+}
+
+void PspGuSession::logEdramMap() const {
+	PSP_INFO_PRINT("[STARK-PSP-STEP02] eDRAM base=0x%08x size=%u lcdDraw=[0,557056) lcdDisp=[557056,1114112) "
+	               "overlay=[%u,%u) sceneColor=[%u,%u)(0x%08x,off=0x%06x,512x256x4,vis=320x240) "
+	               "sceneDepth=[%u,%u)(0x%08x,off=0x%06x,320x240x2) freeAfter=%u\n",
+	               kEdramBase, kEdramSize,
+	               _stats.overlayOffset, _stats.overlayEnd,
+	               _stats.sceneColorOffset, _stats.sceneColorEnd,
+	               (uint32)(uintptr)_sceneColorPtr, (uint32)(uintptr)_sceneColorRel,
+	               _stats.sceneDepthOffset, _stats.sceneDepthEnd,
+	               (uint32)(uintptr)_sceneDepthPtr, (uint32)(uintptr)_sceneDepthRel,
+	               _stats.freeEdramAfterDepth);
 }
 
 bool PspGuSession::acquire(const char *ownerName) {
@@ -377,10 +574,76 @@ bool PspGuSession::acquire(const char *ownerName) {
 	_displayManager->waitUntilRenderFinished();
 	sceGuSync(0, 0);
 
+	// Release legacy 640x480 Screen VRAM backing while keeping logical 640x480 cursor/screen size
+	_displayManager->releaseScreenBackingForNative();
+
 	if (_injectAllocFail) {
 		_injectAllocFail = false;
 		_stats.allocFailures++;
 		freeBuffers();
+		_displayManager->restoreScreenBackingAfterNative();
+		return false;
+	}
+
+	uint32 availVram = 0;
+	if (_injectVramFail) {
+		_injectVramFail = false;
+		_stats.vramFailures++;
+		VramAllocator::instance().verifyNoOverlaps(0, &availVram);
+		PSP_ERROR("PspGuSession: eDRAM scene color alloc failed (injected): requested=%u available=%u\n",
+		          kSceneColorBytes, availVram);
+		freeBuffers();
+		_displayManager->restoreScreenBackingAfterNative();
+		return false;
+	}
+
+	_sceneColorPtr = VramAllocator::instance().allocateAligned(
+			(int32)kSceneColorBytes, kEdramTargetAlign, true, &availVram);
+	if (!_sceneColorPtr) {
+		_stats.vramFailures++;
+		PSP_ERROR("PspGuSession: eDRAM scene color alloc failed: requested=%u available=%u\n",
+		          kSceneColorBytes, availVram);
+		freeBuffers();
+		_displayManager->restoreScreenBackingAfterNative();
+		return false;
+	}
+
+	uint32 availDepth = 0;
+	_sceneDepthPtr = VramAllocator::instance().allocateAligned(
+			(int32)kSceneDepthBytes, kEdramTargetAlign, true, &availDepth);
+	if (!_sceneDepthPtr) {
+		_stats.vramFailures++;
+		PSP_ERROR("PspGuSession: eDRAM scene depth alloc failed: requested=%u available=%u\n",
+		          kSceneDepthBytes, availDepth);
+		freeBuffers();
+		_displayManager->restoreScreenBackingAfterNative();
+		return false;
+	}
+
+	const uint32 lcdEnd = PSP_FRAME_SIZE * sizeof(uint32) * 2;
+	uint32 ovOff = 0, ovEnd = 0;
+	_displayManager->getOverlayVramRange(ovOff, ovEnd);
+	const uint32 scOff = (uint32)(uintptr)_sceneColorPtr - kEdramBase;
+	const uint32 scEnd = scOff + kSceneColorBytes;
+	const uint32 sdOff = (uint32)(uintptr)_sceneDepthPtr - kEdramBase;
+	const uint32 sdEnd = sdOff + kSceneDepthBytes;
+	const uint32 smallOff = kEdramSize - 4096;
+
+	const bool overlapValid = VramAllocator::instance().verifyNoOverlaps() &&
+	                          VramAllocator::instance().containsRange(_sceneColorPtr, kSceneColorBytes) &&
+	                          VramAllocator::instance().containsRange(_sceneDepthPtr, kSceneDepthBytes) &&
+	                          (scOff >= lcdEnd) &&
+	                          (ovEnd == 0 || scOff >= ovEnd || scEnd <= ovOff) &&
+	                          (ovEnd == 0 || sdOff >= ovEnd || sdEnd <= ovOff) &&
+	                          (scEnd <= sdOff || sdEnd <= scOff) &&
+	                          (scEnd <= smallOff) &&
+	                          (sdEnd <= smallOff);
+	if (!overlapValid) {
+		_stats.vramFailures++;
+		PSP_ERROR("PspGuSession: eDRAM interval overlap detected sc=[%u,%u) sd=[%u,%u) ov=[%u,%u)\n",
+		          scOff, scEnd, sdOff, sdEnd, ovOff, ovEnd);
+		freeBuffers();
+		_displayManager->restoreScreenBackingAfterNative();
 		return false;
 	}
 
@@ -389,6 +652,7 @@ bool PspGuSession::acquire(const char *ownerName) {
 	if (!_displayList || !_vertexArena) {
 		_stats.allocFailures++;
 		freeBuffers();
+		_displayManager->restoreScreenBackingAfterNative();
 		return false;
 	}
 
@@ -397,10 +661,21 @@ bool PspGuSession::acquire(const char *ownerName) {
 	sceKernelDcacheWritebackRange(_displayList, kDisplayListSize);
 	sceKernelDcacheWritebackRange(_vertexArena, kVertexArenaSize);
 
+	_sceneColorRel = (void *)(uintptr)scOff;
+	_sceneDepthRel = (void *)(uintptr)sdOff;
+	_stats.overlayOffset = ovOff;
+	_stats.overlayEnd = ovEnd;
+	_stats.sceneColorOffset = scOff;
+	_stats.sceneColorEnd = scEnd;
+	_stats.sceneDepthOffset = sdOff;
+	_stats.sceneDepthEnd = sdEnd;
+	_stats.freeEdramAfterDepth = kEdramSize - sdEnd;
+
 	_vertexOffset = 0;
 	_ownerName = ownerName;
 	_active = true;
 	_frameOpen = false;
+	_sceneRendered = false;
 	_suspended = false;
 	_stats.acquires++;
 
@@ -408,15 +683,18 @@ bool PspGuSession::acquire(const char *ownerName) {
 		_suspendRegistered = PowerManager::instance().registerForSuspend(&_suspendable);
 	}
 	syncGlobalCounters();
+	logEdramMap();
 	return true;
 }
 
 void PspGuSession::release() {
-	if (_frameOpen && _displayManager) {
-		_displayManager->getMasterGuRenderer().finishNativeFrame();
-		_frameOpen = false;
-	}
 	if (_displayManager) {
+		if (_frameOpen) {
+			_displayManager->getMasterGuRenderer().abortSceneSegmentAndReleaseSema();
+			_frameOpen = false;
+		} else {
+			_displayManager->getMasterGuRenderer().releaseNativeSemaIfIdle();
+		}
 		_displayManager->waitUntilRenderFinished();
 	}
 	sceGuSync(0, 0);
@@ -433,7 +711,8 @@ void PspGuSession::release() {
 	_ownerName = 0;
 	freeBuffers();
 
-	if (wasActive) {
+	if (wasActive && _displayManager) {
+		_displayManager->restoreScreenBackingAfterNative();
 		_stats.releases++;
 		syncGlobalCounters();
 	}
@@ -443,10 +722,155 @@ bool PspGuSession::beginFrame() {
 	if (!_active || !_displayManager || _frameOpen || _suspended) {
 		return false;
 	}
-	_displayManager->getMasterGuRenderer().beginNativeFrame(_displayList);
+	_displayManager->getMasterGuRenderer().beginSceneSegment(_displayList);
 	_vertexOffset = 0;
 	_frameOpen = true;
+	bindSceneRenderTarget();
 	syncGlobalCounters();
+	return true;
+}
+
+void PspGuSession::bindSceneRenderTarget() {
+	if (!_active || !_frameOpen || !_sceneColorRel || !_sceneDepthRel) {
+		return;
+	}
+	sceGuDrawBufferList(GU_PSM_8888, _sceneColorRel, kSceneColorStride);
+	sceGuDepthBuffer(_sceneDepthRel, kSceneDepthStride);
+}
+
+void *PspGuSession::getSceneColorUncached() const {
+	return _sceneColorPtr ? UNCACHED(_sceneColorPtr) : 0;
+}
+
+void *PspGuSession::getCurrentLcdBackRel() const {
+	return _displayManager ? _displayManager->getMasterGuRenderer().getCurrentLcdDrawBuffer() : 0;
+}
+
+void PspGuSession::primeScenePadding(uint32 sentinelAbgr) {
+	if (!_sceneColorPtr) {
+		return;
+	}
+	sceGuSync(0, 0);
+	volatile uint32 *fb = (volatile uint32 *)UNCACHED(_sceneColorPtr);
+	for (uint32 y = 0; y < kSceneHeight; ++y) {
+		volatile uint32 *row = fb + y * kSceneColorStride + kSceneWidth;
+		for (uint32 x = kSceneWidth; x < kSceneColorStride; ++x) {
+			*row++ = sentinelAbgr;
+		}
+	}
+	for (uint32 y = kSceneHeight; y < kSceneColorTexHeight; ++y) {
+		volatile uint32 *row = fb + y * kSceneColorStride;
+		for (uint32 x = 0; x < kSceneColorStride; ++x) {
+			*row++ = sentinelAbgr;
+		}
+	}
+	sceGuTexFlush();
+}
+
+bool PspGuSession::flushSceneSegment() {
+	if (!_active || !_displayManager || !_frameOpen) {
+		sceGuSync(0, 0);
+		return false;
+	}
+	if (_vertexOffset > 0 && _vertexArena) {
+		flushDataRange(_vertexArena, _vertexOffset);
+	}
+	const uint32 listBytes = getDisplayListBytesUsed();
+	_stats.lastListBytes = listBytes;
+	if (listBytes > _stats.peakListBytes) {
+		_stats.peakListBytes = listBytes;
+	}
+	_displayManager->getMasterGuRenderer().finishSceneSegmentOnly();
+	_stats.sceneSegments++;
+	_sceneRendered = true;
+	_frameOpen = false;
+	return true;
+}
+
+bool PspGuSession::resumeSceneSegment() {
+	if (!_active || !_displayManager || _frameOpen || _suspended) {
+		return false;
+	}
+	_displayManager->getMasterGuRenderer().resumeSceneSegment(_displayList);
+	_vertexOffset = 0;
+	_frameOpen = true;
+	bindSceneRenderTarget();
+	return true;
+}
+
+bool PspGuSession::readSceneRectToRam(int rx, int ry, int rw, int rh, uint32 *dstRam, int dstStride) {
+	if (!_active || !_sceneColorPtr || !dstRam || rw <= 0 || rh <= 0 || dstStride < rw) {
+		return false;
+	}
+	if (rx < 0 || ry < 0 || rx + rw > (int)kSceneWidth || ry + rh > (int)kSceneHeight) {
+		return false;
+	}
+	if (_frameOpen) {
+		flushSceneSegment();
+	} else {
+		sceGuSync(0, 0);
+	}
+
+	const uint32 copyBytes = (uint32)dstStride * (uint32)rh * sizeof(uint32);
+	sceKernelDcacheWritebackInvalidateRange(dstRam, copyBytes);
+
+	sceGuStart(GU_DIRECT, _displayList);
+	sceGuCopyImage(GU_PSM_8888, rx, ry, rw, rh, kSceneColorStride, _sceneColorPtr,
+	               0, 0, dstStride, dstRam);
+	sceGuTexSync();
+	sceGuFinish();
+	sceGuSync(0, 0);
+
+	sceKernelDcacheInvalidateRange(dstRam, copyBytes);
+	return true;
+}
+
+bool PspGuSession::emitLcdSceneBlitInActiveList() {
+	if (!_active || !_sceneColorPtr || !_sceneRendered) {
+		return false;
+	}
+	struct PresentVertex {
+		float u, v;
+		uint32 color;
+		float x, y, z;
+	};
+
+	sceGuOffset(2048 - (kLcdWidth / 2), 2048 - (kLcdHeight / 2));
+	sceGuViewport(2048, 2048, kLcdWidth, kLcdHeight);
+	sceGuScissor(kPresentLeft, 0, kPresentRight - kPresentLeft, kLcdHeight);
+	sceGuEnable(GU_SCISSOR_TEST);
+	sceGuDisable(GU_DEPTH_TEST);
+	sceGuDepthMask(GU_TRUE);
+	sceGuDisable(GU_STENCIL_TEST);
+	sceGuDisable(GU_ALPHA_TEST);
+	sceGuDisable(GU_BLEND);
+	sceGuDisable(GU_LIGHTING);
+	sceGuDisable(GU_CULL_FACE);
+	sceGuEnable(GU_TEXTURE_2D);
+	sceGuTexFlush();
+	sceGuTexMode(GU_PSM_8888, 0, 0, 0);
+	sceGuTexImage(0, kSceneColorStride, kSceneColorTexHeight, kSceneColorStride, _sceneColorPtr);
+	sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGB);
+	sceGuTexFilter(GU_LINEAR, GU_LINEAR);
+	sceGuTexWrap(GU_CLAMP, GU_CLAMP);
+	sceGuColor(0xFFFFFFFF);
+
+	PresentVertex *verts = (PresentVertex *)sceGuGetMemory(2 * sizeof(PresentVertex));
+	verts[0].u = 0.5f;
+	verts[0].v = 0.5f;
+	verts[0].color = 0xFFFFFFFF;
+	verts[0].x = (float)kPresentLeft;
+	verts[0].y = 0.0f;
+	verts[0].z = 0.0f;
+
+	verts[1].u = (float)kSceneWidth - 0.5f;
+	verts[1].v = (float)kSceneHeight - 0.5f;
+	verts[1].color = 0xFFFFFFFF;
+	verts[1].x = (float)kPresentRight;
+	verts[1].y = (float)kLcdHeight;
+	verts[1].z = 0.0f;
+
+	sceGuDrawArray(GU_SPRITES, GU_TEXTURE_32BITF | GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_2D, 2, 0, verts);
 	return true;
 }
 
@@ -503,9 +927,7 @@ bool PspGuSession::overlayRePresent() {
 		return false;
 	}
 	if (_frameOpen) {
-		_displayManager->renderOverlayClients(true);
-		_stats.overlayRePresents++;
-		return true;
+		return submitFrame(true);
 	}
 	const bool presented = _displayManager->renderAll();
 	if (presented) {
@@ -516,24 +938,34 @@ bool PspGuSession::overlayRePresent() {
 }
 
 bool PspGuSession::submitFrame(bool compositeOverlay) {
-	if (!_active || !_displayManager || !_frameOpen) {
+	if (!_active || !_displayManager) {
 		return false;
 	}
-	if (_vertexOffset > 0 && _vertexArena) {
-		flushDataRange(_vertexArena, _vertexOffset);
+	if (_frameOpen) {
+		flushSceneSegment();
+	} else if (!_sceneRendered) {
+		return false;
 	}
+
+	_displayManager->getMasterGuRenderer().beginLcdPresentList(_displayList);
+	sceGuOffset(2048 - (kLcdWidth / 2), 2048 - (kLcdHeight / 2));
+	sceGuViewport(2048, 2048, kLcdWidth, kLcdHeight);
+	sceGuScissor(0, 0, kLcdWidth, kLcdHeight);
+	sceGuEnable(GU_SCISSOR_TEST);
+	sceGuDisable(GU_DEPTH_TEST);
+	sceGuDepthMask(GU_TRUE);
+	sceGuClearColor(0xFF000000);
+	sceGuClear(GU_COLOR_BUFFER_BIT);
+
+	emitLcdSceneBlitInActiveList();
+	_stats.lcdPresents++;
+
 	if (compositeOverlay && _displayManager->hasAnyOverlayVisible()) {
 		_displayManager->renderOverlayClients(true);
 		_stats.overlayRePresents++;
 	}
-	const uint32 listBytes = getDisplayListBytesUsed();
-	_stats.lastListBytes = listBytes;
-	if (listBytes > _stats.peakListBytes) {
-		_stats.peakListBytes = listBytes;
-	}
 
-	_displayManager->getMasterGuRenderer().finishNativeFrame();
-	_frameOpen = false;
+	_displayManager->getMasterGuRenderer().finishLcdPresentList();
 	syncGlobalCounters();
 	return true;
 }
@@ -551,11 +983,13 @@ int PspGuSession::onSuspend() {
 		return 0;
 	}
 	_suspended = true;
-	if (_frameOpen && _displayManager) {
-		_displayManager->getMasterGuRenderer().finishNativeFrame();
-		_frameOpen = false;
-	}
 	if (_displayManager) {
+		if (_frameOpen) {
+			_displayManager->getMasterGuRenderer().abortSceneSegmentAndReleaseSema();
+			_frameOpen = false;
+		} else {
+			_displayManager->getMasterGuRenderer().releaseNativeSemaIfIdle();
+		}
 		_displayManager->waitUntilRenderFinished();
 	}
 	sceGuSync(0, 0);
@@ -617,7 +1051,9 @@ void DisplayManager::setSizeAndPixelFormat(uint width, uint height, const Graphi
 
 	_screen->setScummvmPixelFormat(format);
 	_screen->setSize(width, height);
-	_screen->allocate();
+	if (!_nativeSession.isActive()) {
+		_screen->allocate();
+	}
 
 	_cursor->setScreenPaletteScummvmPixelFormat(format);
 
@@ -692,6 +1128,36 @@ void DisplayManager::waitUntilRenderFinished() {
 void DisplayManager::releaseNativeSessionOnEngineDone() {
 	if (_nativeSession.isActive()) {
 		_nativeSession.release();
+	}
+}
+
+void DisplayManager::releaseScreenBackingForNative() {
+	waitUntilRenderFinished();
+	sceGuSync(0, 0);
+	if (_screen) {
+		_screen->deallocate();
+	}
+}
+
+void DisplayManager::restoreScreenBackingAfterNative() {
+	waitUntilRenderFinished();
+	sceGuSync(0, 0);
+	if (_screen && _screen->getWidth() > 0 && _screen->getHeight() > 0) {
+		_screen->allocate();
+		_screen->setDirty();
+	}
+}
+
+void DisplayManager::getOverlayVramRange(uint32 &offset, uint32 &end) const {
+	offset = 0;
+	end = 0;
+	if (_overlay) {
+		byte *pixels = _overlay->buffer().getPixels();
+		if (pixels && VramAllocator::isAddressInVram(pixels)) {
+			const uint32 addr = (uint32)CACHED(pixels);
+			offset = addr - PspGuSession::kEdramBase;
+			end = offset + _overlay->buffer().getSizeInBytes();
+		}
 	}
 }
 
@@ -779,6 +1245,7 @@ bool DisplayManager::renderAll() {
 
 		_masterGuRenderer.guPreRender();
 		_screen->setClean();
+		_nativeSession.emitLcdSceneBlitInActiveList();
 		renderOverlayClients(true);
 		_masterGuRenderer.guPostRender();
 		return true;
