@@ -431,20 +431,38 @@ void pspGuCopySurfaceRectToTile(const Graphics::Surface *src, const byte *palett
 	}
 
 	const bool fastRgba = (!palette && src->format == Driver::getRGBAPixelFormat());
+	const bool interiorX = fastRgba && (srcX >= 0) && (srcX + copyW <= src->w);
 	uint16 *dst16Base = static_cast<uint16 *>(dst);
 	for (int32 row = 0; row < copyH; ++row) {
 		const int32 sy = CLIP<int32>(srcY + row, 0, src->h - 1);
 		uint16 *dstRow = dst16Base + row * dstStride;
 		const uint32 *src32Row = fastRgba ? (const uint32 *)src->getBasePtr(0, sy) : nullptr;
-		for (int32 col = 0; col < copyW; ++col) {
-			const int32 sx = CLIP<int32>(srcX + col, 0, src->w - 1);
-			const uint32 abgr = src32Row ? src32Row[sx] : readPixelAbgrFromSurface(src, palette, sx, sy);
+		if (interiorX) {
+			const uint32 *srcInterior = src32Row + srcX;
 			if (psm == GU_PSM_5650) {
-				dstRow[col] = packDither5650(abgr, sx, sy);
+				for (int32 col = 0; col < copyW; ++col) {
+					dstRow[col] = packDither5650(srcInterior[col], srcX + col, sy);
+				}
 			} else if (psm == GU_PSM_4444) {
-				dstRow[col] = packDither4444(abgr, sx, sy);
+				for (int32 col = 0; col < copyW; ++col) {
+					dstRow[col] = packDither4444(srcInterior[col], srcX + col, sy);
+				}
 			} else {
-				dstRow[col] = packDither5551(abgr, sx, sy);
+				for (int32 col = 0; col < copyW; ++col) {
+					dstRow[col] = packDither5551(srcInterior[col], srcX + col, sy);
+				}
+			}
+		} else {
+			for (int32 col = 0; col < copyW; ++col) {
+				const int32 sx = CLIP<int32>(srcX + col, 0, src->w - 1);
+				const uint32 abgr = src32Row ? src32Row[sx] : readPixelAbgrFromSurface(src, palette, sx, sy);
+				if (psm == GU_PSM_5650) {
+					dstRow[col] = packDither5650(abgr, sx, sy);
+				} else if (psm == GU_PSM_4444) {
+					dstRow[col] = packDither4444(abgr, sx, sy);
+				} else {
+					dstRow[col] = packDither5551(abgr, sx, sy);
+				}
 			}
 		}
 	}
@@ -2176,7 +2194,7 @@ void PspGuDriver::flipBuffer() {
 		warning("PspGuDriver: submitFrame failed, unwinding cleanly");
 		return;
 	}
-	_session->waitFrame();
+	// DisplayCbThread presents asynchronously; beginSceneSegment() syncs before reusing lists.
 
 	const uint64 tFlipEndUs = (uint64)sceKernelGetSystemTimeWide();
 	const uint32 cpuUs = (_frameClearUs > 0 && tSubStartUs >= _frameClearUs) ? (uint32)(tSubStartUs - _frameClearUs) : 0u;

@@ -240,6 +240,8 @@ public:
 	void saveLoadCurrent(ResourceSerializer *serializer) override;
 
 	// Anim API
+	void applyToItem(Item *item) override;
+	void removeFromItem(Item *item) override;
 	Visual *getVisual() override;
 	void playAsAction(ItemVisual *item) override;
 	void shouldResetItem(bool resetItem) override;
@@ -252,6 +254,7 @@ protected:
 	typedef Common::Array<Common::Rect> RectArray;
 
 	void printData() override;
+	void ensureSmackerLoaded();
 	Common::SeekableReadStream *openOverrideFile(const Common::String &extension) const;
 
 	/** Update the position of the video for the current frame */

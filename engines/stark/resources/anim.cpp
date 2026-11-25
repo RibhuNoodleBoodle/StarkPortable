@@ -321,34 +321,58 @@ void AnimVideo::readData(Formats::XRCReadStream *stream) {
 }
 
 void AnimVideo::onAllLoaded() {
-	if (!_smacker) {
-
-		_smacker = new VisualSmacker(StarkGfx);
-
-		Common::SeekableReadStream *overrideStreamBink = nullptr;
-		Common::SeekableReadStream *overrideStreamSmacker = nullptr;
-		if (StarkSettings->isAssetsModEnabled() && StarkGfx->supportsModdedAssets()) {
-			overrideStreamBink = openOverrideFile(".bik");
-			if (!overrideStreamBink) {
-				overrideStreamSmacker = openOverrideFile(".smk");
-			}
-		}
-
-		Common::SeekableReadStream *stream = StarkArchiveLoader->getExternalFile(_smackerFile, _archiveName);
-		if (overrideStreamBink) {
-			_smacker->loadBink(overrideStreamBink);
-			_smacker->readOriginalSize(stream);
-		} else if (overrideStreamSmacker) {
-			_smacker->loadSmacker(overrideStreamSmacker);
-			_smacker->readOriginalSize(stream);
-		} else {
-			_smacker->loadSmacker(stream);
-		}
-
-		_smacker->overrideFrameRate(_frameRateOverride);
-
-		updateSmackerPosition();
+	if (isInUse()) {
+		ensureSmackerLoaded();
 	}
+}
+
+void AnimVideo::ensureSmackerLoaded() {
+	if (_smacker) {
+		return;
+	}
+
+	_smacker = new VisualSmacker(StarkGfx);
+
+	Common::SeekableReadStream *overrideStreamBink = nullptr;
+	Common::SeekableReadStream *overrideStreamSmacker = nullptr;
+	if (StarkSettings->isAssetsModEnabled() && StarkGfx->supportsModdedAssets()) {
+		overrideStreamBink = openOverrideFile(".bik");
+		if (!overrideStreamBink) {
+			overrideStreamSmacker = openOverrideFile(".smk");
+		}
+	}
+
+	Common::SeekableReadStream *stream = StarkArchiveLoader->getExternalFile(_smackerFile, _archiveName);
+	if (overrideStreamBink) {
+		_smacker->loadBink(overrideStreamBink);
+		_smacker->readOriginalSize(stream);
+	} else if (overrideStreamSmacker) {
+		_smacker->loadSmacker(overrideStreamSmacker);
+		_smacker->readOriginalSize(stream);
+	} else {
+		_smacker->loadSmacker(stream);
+	}
+
+	_smacker->overrideFrameRate(_frameRateOverride);
+
+	updateSmackerPosition();
+}
+
+void AnimVideo::applyToItem(Item *item) {
+	Anim::applyToItem(item);
+	if (isInUse()) {
+		ensureSmackerLoaded();
+	}
+}
+
+void AnimVideo::removeFromItem(Item *item) {
+	Anim::removeFromItem(item);
+#if defined(__PSP__)
+	if (!isInUse() && _smacker) {
+		delete _smacker;
+		_smacker = nullptr;
+	}
+#endif
 }
 
 Common::SeekableReadStream *AnimVideo::openOverrideFile(const Common::String &extension) const {
@@ -416,6 +440,9 @@ void AnimVideo::onEnginePause(bool pause) {
 }
 
 Visual *AnimVideo::getVisual() {
+	if (isInUse()) {
+		ensureSmackerLoaded();
+	}
 	return _smacker;
 }
 
@@ -439,6 +466,8 @@ void AnimVideo::playAsAction(ItemVisual *item) {
 	_shouldResetItem = true;
 	_done = false;
 
+	ensureSmackerLoaded();
+
 	if (!_loop) {
 		_smacker->rewind();
 	}
@@ -448,6 +477,9 @@ void AnimVideo::playAsAction(ItemVisual *item) {
 }
 
 bool AnimVideo::isAtTime(uint32 time) const {
+	if (!_smacker) {
+		return true;
+	}
 	uint32 currentTime = _smacker->getCurrentTime();
 	return currentTime >= time;
 }
@@ -455,9 +487,13 @@ bool AnimVideo::isAtTime(uint32 time) const {
 void AnimVideo::saveLoadCurrent(ResourceSerializer *serializer) {
 	Anim::saveLoadCurrent(serializer);
 
-	int32 frameNumber = _smacker->getFrameNumber();
+	int32 frameNumber = _smacker ? _smacker->getFrameNumber() : -1;
 	serializer->syncAsSint32LE(frameNumber);
 	serializer->syncAsSint32LE(_refCount);
+
+	if (serializer->isLoading() && isInUse()) {
+		ensureSmackerLoaded();
+	}
 
 	// TODO: Seek to the saved frame number when loading
 }

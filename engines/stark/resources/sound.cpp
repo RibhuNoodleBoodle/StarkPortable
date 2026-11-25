@@ -23,6 +23,7 @@
 
 #include "audio/decoders/vorbis.h"
 
+#include "common/memstream.h"
 #include "common/system.h"
 
 #include "engines/stark/formats/iss.h"
@@ -35,6 +36,24 @@
 
 namespace Stark {
 namespace Resources {
+
+#if defined(__PSP__)
+static Common::SeekableReadStream *cacheSmallSoundStream(Common::SeekableReadStream *stream) {
+	if (!stream) {
+		return nullptr;
+	}
+	const int64 size = stream->size();
+	if (size > 0 && size <= 384 * 1024) {
+		Common::SeekableReadStream *memStream = stream->readStream((uint32)size);
+		if (memStream) {
+			delete stream;
+			return memStream;
+		}
+		stream->seek(0);
+	}
+	return stream;
+}
+#endif
 
 Sound::~Sound() {
 }
@@ -71,6 +90,9 @@ Audio::RewindableAudioStream *Sound::makeAudioStream() {
 	}
 
 	if (stream) {
+#if defined(__PSP__)
+		stream = cacheSmallSoundStream(stream);
+#endif
 		audioStream = Formats::makeISSStream(stream, DisposeAfterUse::YES);
 	}
 
@@ -86,6 +108,9 @@ Audio::RewindableAudioStream *Sound::makeAudioStream() {
 		stream = StarkArchiveLoader->getExternalFile(filename, _archiveName);
 		if (stream) {
 #ifdef USE_VORBIS
+#if defined(__PSP__)
+			stream = cacheSmallSoundStream(stream);
+#endif
 			audioStream = Audio::makeVorbisStream(stream, DisposeAfterUse::YES);
 #else
 			warning("Cannot decode sound '%s', Vorbis support is not compiled in", filename.toString().c_str());

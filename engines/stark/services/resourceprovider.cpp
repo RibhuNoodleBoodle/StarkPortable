@@ -157,6 +157,10 @@ void ResourceProvider::popCurrentLocation() {
 }
 
 void ResourceProvider::requestLocationChange(uint16 level, uint16 location) {
+#if defined(__PSP__)
+	// Unload any previously inactive locations before opening archives for the next room
+	purgeOldLocations();
+#endif
 	Current *currentLocation = new Current();
 	_locations.push_back(currentLocation);
 
@@ -320,7 +324,12 @@ void ResourceProvider::setScrollInitialPosition() {
 }
 
 void ResourceProvider::purgeOldLocations() {
-	while (_locations.size() > 2) {
+#if defined(__PSP__)
+	const uint maxLocations = 1;
+#else
+	const uint maxLocations = 2;
+#endif
+	while (_locations.size() > maxLocations) {
 		Current *location = _locations.front();
 
 		_stateProvider->saveLocationState(location->getLevel(), location->getLocation());

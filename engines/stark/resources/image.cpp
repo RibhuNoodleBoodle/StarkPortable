@@ -124,30 +124,21 @@ int Image::indexForPoint(const Common::Point &point) const {
 }
 
 bool Image::isPointInPolygon(const Polygon &polygon, const Common::Point &point) const {
-	if (polygon.size() <= 1) {
-		return false; // Empty polygon
+	if (polygon.size() <= 2) {
+		return false; // Empty or degenerate polygon
 	}
 
-	// A ray cast from the point
-	Math::Segment2d testLine(Math::Vector2d(point.x, point.y), Math::Vector2d(-100, -100));
-
-	// Special case the line created between the last point and the first
-	Math::Vector2d prevPoint = Math::Vector2d(polygon.back().x, polygon.back().y);
-
-	// Count the intersections of the ray with the polygon's edges
-	int intersectCount = 0;
-	for (uint32 j = 0; j < polygon.size(); j++) {
-		Math::Vector2d curPoint = Math::Vector2d(polygon[j].x, polygon[j].y);
-
-		if (Math::Segment2d(prevPoint, curPoint).intersectsSegment(testLine, nullptr)) {
-			intersectCount++;
+	bool inside = false;
+	for (uint32 i = 0, j = polygon.size() - 1; i < polygon.size(); j = i++) {
+		const Common::Point &pi = polygon[i];
+		const Common::Point &pj = polygon[j];
+		if (((pi.y > point.y) != (pj.y > point.y)) &&
+		    (point.x < (pj.x - pi.x) * (point.y - pi.y) / (float)(pj.y - pi.y) + pi.x)) {
+			inside = !inside;
 		}
-
-		prevPoint = curPoint;
 	}
 
-	// If the ray crosses the polygon an odd number of times, the point is inside the polygon
-	return intersectCount % 2 != 0;
+	return inside;
 }
 
 Common::Point Image::getHotspotPosition(uint index) const {

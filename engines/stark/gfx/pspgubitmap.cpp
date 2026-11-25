@@ -224,7 +224,21 @@ void PspGuBitmap::update(const Graphics::Surface *surface, const byte *palette) 
 
 	const uint32 newW = (uint32)surface->w;
 	const uint32 newH = (uint32)surface->h;
-	const int targetPsm = pspGuClassifySurfacePsm(surface, palette);
+	int targetPsm;
+	if (_width == newW && _height == newH && !_tiles.empty() && _tiles[0].psm == GU_PSM_5650 &&
+	    !palette && newW == 640 && newH >= 180 && surface->format == Driver::getRGBAPixelFormat()) {
+		// Full-width opaque video/background updates keep 5650 without scanning every pixel for alpha.
+		const uint32 tl = *(const uint32 *)surface->getBasePtr(0, 0);
+		const uint32 mid = *(const uint32 *)surface->getBasePtr(newW >> 1, newH >> 1);
+		const uint32 br = *(const uint32 *)surface->getBasePtr(newW - 1, newH - 1);
+		if (((tl & mid & br) & 0xFF000000u) == 0xFF000000u) {
+			targetPsm = GU_PSM_5650;
+		} else {
+			targetPsm = pspGuClassifySurfacePsm(surface, palette);
+		}
+	} else {
+		targetPsm = pspGuClassifySurfacePsm(surface, palette);
+	}
 	const uint32 bpp = (targetPsm == GU_PSM_8888) ? 4 : 2;
 
 	Common::Array<AxisChunk> xChunks;

@@ -231,7 +231,11 @@ void StarkEngine::updateDisplayScene() {
 		// skips the same amount of simulated time as the original.
 		StarkGlobal->setMillisecondsPerGameloop(33);
 	} else {
+#if defined(__PSP__)
+		StarkGlobal->setMillisecondsPerGameloop(MIN<uint>(_frameLimiter->getLastFrameDuration(), 100u));
+#else
 		StarkGlobal->setMillisecondsPerGameloop(_frameLimiter->getLastFrameDuration());
+#endif
 	}
 
 	// Clear the screen
