@@ -116,6 +116,7 @@ public:
 	void flushDataRange(const void *ptr, uint32 bytes) const;
 
 	uint32 getDisplayListBytesUsed() const;
+	const uint8 *getDisplayListPtr() const { return _displayList; }
 	bool hasDisplayListHeadroom(uint32 neededBytes = 0) const;
 	uint32 getVertexOffset() const { return _vertexOffset; }
 	bool hasVertexHeadroom(uint32 neededBytes, uint32 alignment = 16) const {

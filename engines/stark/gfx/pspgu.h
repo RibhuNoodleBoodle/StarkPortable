@@ -69,7 +69,9 @@ uint32 pspGuGetPeakTextureBytes();
 uint32 pspGuGetLiveAuxBytes();
 uint32 pspGuGetPeakAuxBytes();
 void *pspGuAllocAlignedWithRetry(uint32 alignment, uint32 size);
+#ifdef STARK_PSP_DIAGNOSTICS
 void pspGuSetInjectAllocFail(bool enable);
+#endif
 uint32 pspGuReclaimIdleResources(uint32 minBytes = 0);
 
 /**
@@ -126,17 +128,20 @@ public:
 	void mapLogical2DRectToRt(int32 destX, int32 destY, uint32 rectW, uint32 rectH,
 	                          bool noScalingOverride, bool snapToGrid,
 	                          float &outX0, float &outY0, float &outX1, float &outY1) const;
-	void reportUnimplemented(const char *methodName);
 
 	static void ensureResourceSafeToModify(uint32 drawnFrameSeq);
 
 private:
 	void updateRtViewport();
+#ifdef STARK_PSP_DIAGNOSTICS
 	void verifyStartupContracts();
 	bool verifyStep03SurfaceAndTextureContracts(uint32 *readbackBuf, uint32 readbackStride);
 	bool verifyStep04HardwareTLContracts(uint32 *readbackBuf, uint32 readbackStride);
 	bool verifyStep05EffectsParityContracts(uint32 *readbackBuf, uint32 readbackStride);
 	bool verifyStep06MemoryAndPerfContracts(uint32 *readbackBuf, uint32 readbackStride);
+	void auditLiveGeFrameCommands(uint32 listBytesUsed);
+	bool _geAuditLogged;
+#endif
 	bool applyEffectOverlayState(const Common::Point &dest, const Common::Point &bounds) const;
 
 	struct FrameTimingSample {
@@ -157,7 +162,6 @@ private:
 	bool _clearRequested;
 	bool _reverseDepth;
 	uint32 _frameSeq;
-	uint32 _unimplementedMask;
 	FrameTimingSample _timingRing[kTimingRingSize];
 	uint32 _timingRingHead;
 	uint32 _timingRingCount;

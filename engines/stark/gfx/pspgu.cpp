@@ -51,9 +51,9 @@
 #include "engines/stark/visual/image.h"
 
 #include "common/algorithm.h"
-
 #include "common/debug.h"
 #include "common/endian.h"
+#include "common/textconsole.h"
 #include "graphics/surface.h"
 
 namespace Stark {
@@ -61,10 +61,15 @@ namespace Gfx {
 
 namespace {
 
+#ifdef STARK_PSP_DIAGNOSTICS
 struct SmokeVertex3D {
 	uint32 color;
 	float x, y, z;
 };
+
+const uint32 kPaddingSentinelAbgr = 0xFFFF00FFu;
+bool s_injectAllocFail = false;
+#endif
 
 struct ColorVertex2D {
 	uint32 color;
@@ -72,7 +77,6 @@ struct ColorVertex2D {
 };
 
 const char *const kNativeOwner = "stark-pspgu";
-const uint32 kPaddingSentinelAbgr = 0xFFFF00FFu;
 const uint32 kGeTextureBudgetCeiling = 4 * 1024 * 1024;
 
 PspGuDriver *s_activeDriver = nullptr;
@@ -84,14 +88,13 @@ uint32 s_liveAuxBytes = 0;
 uint32 s_peakAuxBytes = 0;
 uint32 s_externalAuxBytes = 0;
 uint32 s_evictionCount = 0;
-bool s_injectAllocFail = false;
 bool s_warnedBudgetCeiling = false;
 
 void checkBudgetCeiling() {
 	const uint32 total = s_liveBitmapBytes + s_liveTextureBytes + s_liveAuxBytes;
 	if (!s_warnedBudgetCeiling && total > kGeTextureBudgetCeiling) {
 		s_warnedBudgetCeiling = true;
-		warning("STARK PSP Step03: GE texture+bitmap RAM %u bytes exceeded 4 MiB ceiling", total);
+		warning("STARK PSP: GE texture+bitmap RAM %u bytes exceeded 4 MiB ceiling", total);
 	}
 }
 
@@ -572,9 +575,11 @@ uint32 pspGuGetPeakTextureBytes() { return s_peakTextureBytes; }
 uint32 pspGuGetLiveAuxBytes() { return s_liveAuxBytes; }
 uint32 pspGuGetPeakAuxBytes() { return s_peakAuxBytes; }
 
+#ifdef STARK_PSP_DIAGNOSTICS
 void pspGuSetInjectAllocFail(bool enable) {
 	s_injectAllocFail = enable;
 }
+#endif
 
 uint32 pspGuReclaimIdleResources(uint32 minBytes) {
 	PspGuSession *sess = s_activeDriver ? s_activeDriver->getSession() : nullptr;
@@ -598,6 +603,7 @@ void *pspGuAllocAlignedWithRetry(uint32 alignment, uint32 size) {
 		return nullptr;
 	}
 	void *ptr = nullptr;
+#ifdef STARK_PSP_DIAGNOSTICS
 	if (!s_injectAllocFail) {
 		ptr = memalign(alignment, size);
 	}
@@ -610,6 +616,13 @@ void *pspGuAllocAlignedWithRetry(uint32 alignment, uint32 size) {
 			s_injectAllocFail = false;
 		}
 	}
+#else
+	ptr = memalign(alignment, size);
+	if (!ptr) {
+		pspGuReclaimIdleResources(size);
+		ptr = memalign(alignment, size);
+	}
+#endif
 	return ptr;
 }
 
@@ -626,12 +639,14 @@ void PspGuDriver::ensureResourceSafeToModify(uint32 drawnFrameSeq) {
 }
 
 PspGuDriver::PspGuDriver() :
+#ifdef STARK_PSP_DIAGNOSTICS
+		_geAuditLogged(false),
+#endif
 		_session(nullptr),
 		_sessionReady(false),
 		_clearRequested(false),
 		_reverseDepth(true),
 		_frameSeq(1),
-		_unimplementedMask(0),
 		_timingRingHead(0),
 		_timingRingCount(0),
 		_frameClearUs(0),
@@ -740,6 +755,7 @@ void PspGuDriver::mapLogical2DRectToRt(int32 destX, int32 destY, uint32 rectW, u
 	outY1 = outY0 + (float)rectH * sizeScaleY;
 }
 
+#ifdef STARK_PSP_DIAGNOSTICS
 bool PspGuDriver::verifyStep03SurfaceAndTextureContracts(uint32 *readbackBuf, uint32 readbackStride) {
 	if (!readbackBuf) {
 		return false;
@@ -1981,18 +1997,77 @@ void PspGuDriver::verifyStartupContracts() {
 	      st.suspendCount, st.resumeCount, st.acquires, st.releases);
 }
 
+void PspGuDriver::auditLiveGeFrameCommands(uint32 listBytesUsed) {
+	if (!_session || !_session->getDisplayListPtr() || listBytesUsed < 4) {
+		return;
+	}
+	const uint32 *words = reinterpret_cast<const uint32 *>(_session->getDisplayListPtr());
+	const uint32 wordCount = listBytesUsed / 4;
+	uint32 lastVtype = 0;
+	uint32 fbp = 0, fbw = 0, zbp = 0, zbw = 0, base = 0;
+	uint32 draws2D = 0, draws3D = 0, primTris = 0, primSprites = 0, primLines = 0;
+	uint32 projLoads = 0, viewLoads = 0, worldLoads = 0, boneLoads = 0, lightCmds = 0, texBinds = 0;
+	for (uint32 i = 0; i < wordCount; ++i) {
+		const uint32 w = words[i];
+		const uint8 cmd = (uint8)(w >> 24);
+		const uint32 arg = w & 0x00FFFFFFu;
+		switch (cmd) {
+		case 0x10: base = arg; break; // BASE
+		case 0x12: lastVtype = arg; break; // VTYPE
+		case 0x04: { // PRIM
+			const uint32 ptype = (arg >> 16) & 7u;
+			if (lastVtype & 0x800000u) {
+				draws2D++;
+			} else {
+				draws3D++;
+			}
+			if (ptype == 3) {
+				primTris++;
+			} else if (ptype == 6) {
+				primSprites++;
+			} else if (ptype == 1) {
+				primLines++;
+			}
+			break;
+		}
+		case 0x3A: projLoads++; break;  // PROJ
+		case 0x3C: viewLoads++; break;  // VIEW
+		case 0x3E: worldLoads++; break; // WORLD
+		case 0x2A: boneLoads++; break;  // BONE
+		case 0x63: case 0x64: case 0x65: case 0x66: lightCmds++; break; // LT0..3
+		case 0x9C: fbp = arg; break;
+		case 0x9D: fbw = arg; break;
+		case 0x9E: zbp = arg; break;
+		case 0x9F: zbw = arg; break;
+		case 0xA0: texBinds++; break;
+		default: break;
+		}
+	}
+	if (draws3D > 0 && draws2D > 0) {
+		_geAuditLogged = true;
+		const PspGuSessionStats &st = _session->getStats();
+		debug("[STARK-PSP-GE-AUDIT] frame=%u listBytes=%u vertBytes=%u fbp=0x%06x(hi=0x%02x) fbw=%u zbp=0x%06x(hi=0x%02x) zbw=%u "
+		      "draws2D=%u draws3D=%u tris=%u sprites=%u lines=%u proj=%u view=%u world=%u bones=%u lights=%u texBinds=%u "
+		      "sceneColor=[%u,%u) sceneDepth=[%u,%u) overlay=[%u,%u) base=0x%06x",
+		      _frameSeq, listBytesUsed, _session->getVertexOffset(),
+		      fbp, (fbw >> 16) & 0xFFu, fbw & 0xFFFFu,
+		      zbp, (zbw >> 16) & 0xFFu, zbw & 0xFFFFu,
+		      draws2D, draws3D, primTris, primSprites, primLines,
+		      projLoads, viewLoads, worldLoads, boneLoads, lightCmds, texBinds,
+		      st.sceneColorOffset, st.sceneColorEnd, st.sceneDepthOffset, st.sceneDepthEnd,
+		      st.overlayOffset, st.overlayEnd, base);
+	}
+}
+#endif // STARK_PSP_DIAGNOSTICS
+
 void PspGuDriver::init() {
 	_session = PspGuSession::getBackendSession();
 	if (!_session) {
-		warning("PspGuDriver: PSP backend native GU session unavailable");
-		_sessionReady = false;
-		return;
+		error("PspGuDriver: PSP backend native GU session unavailable");
 	}
 
 	if (!_session->acquire(kNativeOwner)) {
-		warning("PspGuDriver: failed transactional acquire of native GU session");
-		_sessionReady = false;
-		return;
+		error("PspGuDriver: failed transactional acquire of native GU session");
 	}
 
 	s_activeDriver = this;
@@ -2001,11 +2076,13 @@ void PspGuDriver::init() {
 	computeScreenViewport();
 	setScreenViewport(false);
 
+#ifdef STARK_PSP_DIAGNOSTICS
 	verifyStartupContracts();
 	setScreenViewport(false);
 	logMemoryAndPacingSnapshot("postAcquire");
+#endif
 
-	debug("[STARK-PSP-STEP03] PspGuDriver ready (session=%s, listCap=%u, reserve=%u, vertexArena=%u, logical=%dx%d, rt=%ux%u)",
+	debug("[STARK-PSP] PspGuDriver ready (session=%s, listCap=%u, reserve=%u, vertexArena=%u, logical=%dx%d, rt=%ux%u)",
 	      _sessionReady ? "ready" : "unavailable",
 	      PspGuSession::kDisplayListSize,
 	      PspGuSession::kDisplayListReserve,
@@ -2087,6 +2164,12 @@ void PspGuDriver::flipBuffer() {
 	const uint32 listUsedNow = _session->getDisplayListBytesUsed();
 	const uint32 vertUsedNow = _session->getVertexOffset();
 
+#ifdef STARK_PSP_DIAGNOSTICS
+	if (!_geAuditLogged && _frameDrawCalls > 0 && s_liveTextureBytes > 0) {
+		auditLiveGeFrameCommands(listUsedNow);
+	}
+#endif
+
 	if (!_session->submitFrame(true)) {
 		warning("PspGuDriver: submitFrame failed, unwinding cleanly");
 		return;
@@ -2112,6 +2195,7 @@ void PspGuDriver::flipBuffer() {
 		_timingRingCount++;
 	}
 
+#ifdef STARK_PSP_DIAGNOSTICS
 	if (_frameSeq <= 5 || (_frameSeq % 240) == 0) {
 		const PspGuSessionStats &st = _session->getStats();
 		debug("[STARK-PSP-STEP03] frame=%u swaps=%u list=%u/%u verts=%u/%u liveBmp=%u(peak=%u) liveTex=%u(peak=%u) liveAux=%u uord=%u",
@@ -2124,6 +2208,7 @@ void PspGuDriver::flipBuffer() {
 			logMemoryAndPacingSnapshot("periodic");
 		}
 	}
+#endif
 	_frameSeq++;
 }
 
@@ -2214,7 +2299,7 @@ void PspGuDriver::logMemoryAndPacingSnapshot(const char *tag, uint16 level, uint
 		dcMean = (uint32)(dcSum / cnt);
 	}
 
-	debug("[STARK-PSP-STEP06] tag=%s loc=%u/%u frame=%u n=%u totUs(mean=%u,med=%u,p95=%u,p99=%u) "
+	debug("[STARK-PSP-PERF] tag=%s loc=%u/%u frame=%u n=%u totUs(mean=%u,med=%u,p95=%u,p99=%u) "
 	      "cpuUs(mean=%u,p95=%u) geSyncUs(mean=%u,p95=%u) dcMean=%u splits=%u evict=%u "
 	      "geMem(bmp=%u/%u,tex=%u/%u,aux=%u/%u,hitMask=%u) peak(list=%u,vert=%u) "
 	      "heap(uord=%u,arena=%u,ford=%u) sys(free=%u,maxBlk=%u)",
@@ -2456,20 +2541,6 @@ bool PspGuDriver::renderEffectLines(const Common::Point &dest, const Common::Poi
 
 bool PspGuDriver::computeLightsEnabled() {
 	return _computeLights;
-}
-
-void PspGuDriver::reportUnimplemented(const char *methodName) {
-	uint32 hash = 2166136261u;
-	for (const char *p = methodName; p && *p; ++p) {
-		hash ^= (uint8)*p;
-		hash *= 16777619u;
-	}
-	const uint32 bit = 1u << (hash & 31u);
-	if ((_unimplementedMask & bit) == 0) {
-		_unimplementedMask |= bit;
-		warning("STARK PSP Step04: %s is developmentally unavailable (unimplemented until Step 05+)",
-		        methodName ? methodName : "unknown");
-	}
 }
 
 } // End of namespace Gfx
