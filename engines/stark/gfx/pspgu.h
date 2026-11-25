@@ -129,6 +129,7 @@ public:
 	                          bool noScalingOverride, bool snapToGrid,
 	                          float &outX0, float &outY0, float &outX1, float &outY1) const;
 
+	static uint32 getCurrentFrameSeq();
 	static void ensureResourceSafeToModify(uint32 drawnFrameSeq);
 
 private:

@@ -102,6 +102,9 @@ void Button::goToAnimStatement(int animScriptItemIndex) {
 
 void Button::startImageExplosion(VisualImageXMG *image) {
 	assert(image);
+	if (!image->getSurface()) {
+		return;
+	}
 
 	stopImageExplosion();
 	_explodingImageAnimation = new VisualExplodingImage(StarkGfx);
@@ -115,6 +118,9 @@ void Button::stopImageExplosion() {
 
 void Button::startImageFlashing(VisualImageXMG *image) {
 	assert(image);
+	if (!image->getSurface()) {
+		return;
+	}
 
 	stopImageFlashing();
 	_flashingImageAnimation = new VisualFlashingImage(StarkGfx);

@@ -274,6 +274,9 @@ void MasterGuRenderer::threadFunction() {
 // Sleep on the render mutex if the rendering thread hasn't finished its work
 //
 void MasterGuRenderer::sleepUntilRenderFinished() {
+	if (_nativeHoldsSema) {
+		return;
+	}
 	if (!isRenderFinished()) {
 		_renderSema.take();   // sleep on the semaphore
 		_renderSema.give();
@@ -808,6 +811,9 @@ bool PspGuSession::readSceneRectToRam(int rx, int ry, int rw, int rh, uint32 *ds
 	if (_frameOpen) {
 		flushSceneSegment();
 	} else {
+		if (_displayManager) {
+			_displayManager->waitUntilRenderFinished();
+		}
 		sceGuSync(0, 0);
 	}
 

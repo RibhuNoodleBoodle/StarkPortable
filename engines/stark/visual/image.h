@@ -91,6 +91,9 @@ public:
 	/** Get a read only pointer to the surface backing the image */
 	const Graphics::Surface *getSurface() const;
 
+	/** Retain CPU surface when needed for button/visual effects */
+	void keepSurfaceForEffects() { _keepSurface = true; }
+
 private:
 	Graphics::Surface *multiplyColorWithAlpha(const Graphics::Surface *source);
 	void compactSurfaceIfSafe();
@@ -105,6 +108,7 @@ private:
 	uint16 _surfaceW;
 	uint16 _surfaceH;
 	bool _hasSolidMask;
+	bool _keepSurface;
 	Common::Array<uint8> _solidMask;
 };
 

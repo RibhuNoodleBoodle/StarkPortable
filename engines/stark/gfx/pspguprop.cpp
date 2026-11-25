@@ -139,8 +139,8 @@ void PspGuPropRenderer::buildBatches() {
 			}
 			const uint32 vBytes = localVerts.size() * sizeof(PropVertexHW);
 			const uint32 iBytes = localIndices.size() * sizeof(uint16);
-			PropVertexHW *vMem = static_cast<PropVertexHW *>(memalign(64, vBytes));
-			uint16 *iMem = static_cast<uint16 *>(memalign(64, iBytes));
+			PropVertexHW *vMem = static_cast<PropVertexHW *>(pspGuAllocAlignedWithRetry(64, vBytes));
+			uint16 *iMem = static_cast<uint16 *>(pspGuAllocAlignedWithRetry(64, iBytes));
 			if (!vMem || !iMem) {
 				free(vMem);
 				free(iMem);

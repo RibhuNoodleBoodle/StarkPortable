@@ -99,7 +99,8 @@ private:
 	Math::Vector3d computeShadowLightDirection(const Common::Array<Gfx::LightEntry *> &lights,
 	                                           const Math::Vector3d &actorPosition,
 	                                           const Math::Matrix3 &worldToModelRot) const;
-	void renderShadowPass(const Math::Matrix4 &model, const Math::Vector3d &position,
+	void renderShadowPass(const Math::Matrix4 &projection, const Math::Matrix4 &view,
+	                      const Math::Matrix4 &model, const Math::Vector3d &position,
 	                      const Common::Array<Gfx::LightEntry *> &lights,
 	                      const Common::Array<BoneNode *> &bones) const;
 

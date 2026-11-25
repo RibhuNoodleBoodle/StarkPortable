@@ -109,6 +109,7 @@ void PspGuTexture::bindWrapped(int wrapU, int wrapV, bool linearFilter) const {
 	if (validLevels == 0) {
 		return;
 	}
+	_lastBoundFrameSeq = PspGuDriver::getCurrentFrameSeq();
 
 	if (_isIndexedT8 && _clut) {
 		sceGuClutMode(GU_PSM_8888, 0, 0xFF, 0);

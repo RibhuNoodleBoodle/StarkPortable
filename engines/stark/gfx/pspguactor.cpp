@@ -119,6 +119,7 @@ void PspGuActorRenderer::buildBatches() {
 
 	uint32 rigidTriTotal = 0;
 	uint32 seamTriTotal = 0;
+	bool warnedUvRange = false;
 
 	for (uint32 fi = 0; fi < faces.size(); ++fi) {
 		const Face *face = faces[fi];
@@ -126,6 +127,32 @@ void PspGuActorRenderer::buildBatches() {
 			continue;
 		}
 		const uint32 triCount = face->vertexIndices.size() / 3;
+
+		float minU = 0.0f, maxU = 0.0f;
+		bool hasU = false;
+		for (uint32 vi = 0; vi < face->vertexIndices.size(); ++vi) {
+			const uint32 idx = face->vertexIndices[vi];
+			if (idx >= srcVerts.size()) {
+				continue;
+			}
+			const float negU = -srcVerts[idx]->_texS;
+			if (!hasU) {
+				minU = maxU = negU;
+				hasU = true;
+			} else {
+				if (negU < minU) minU = negU;
+				if (negU > maxU) maxU = negU;
+			}
+		}
+		const bool foldU = !hasU || (minU >= -1.0f && maxU <= 1.0f);
+		if (!foldU && !warnedUvRange) {
+			warning("PspGuActorRenderer: actor UV u outside [-1,1] (min=%.3f max=%.3f); using GU_REPEAT", minU, maxU);
+			warnedUvRange = true;
+		}
+		auto mapActorU = [foldU](float texS) -> float {
+			const float negU = -texS;
+			return foldU ? fabsf(fmodf(negU, 2.0f)) : negU;
+		};
 
 		// Accumulate rigid batches (<=8 bones/batch) and seam triangles for this face
 		Common::Array<uint32> batchVertSrc;
@@ -151,8 +178,8 @@ void PspGuActorRenderer::buildBatches() {
 			const uint32 vBytes = batchVertSrc.size() * fStride * sizeof(float);
 			const uint32 iBytes = batchTriIdx.size() * sizeof(uint16);
 
-			float *vMem = static_cast<float *>(memalign(64, vBytes));
-			uint16 *iMem = static_cast<uint16 *>(memalign(64, iBytes));
+			float *vMem = static_cast<float *>(pspGuAllocAlignedWithRetry(64, vBytes));
+			uint16 *iMem = static_cast<uint16 *>(pspGuAllocAlignedWithRetry(64, iBytes));
 			if (!vMem || !iMem) {
 				free(vMem);
 				free(iMem);
@@ -174,7 +201,7 @@ void PspGuActorRenderer::buildBatches() {
 						}
 					}
 					const Math::Vector3d &p = getRigidVertPos(vn);
-					dst[weightFloats + 0] = vn->_texS;
+					dst[weightFloats + 0] = mapActorU(vn->_texS);
 					dst[weightFloats + 1] = vn->_texT;
 					dst[weightFloats + 2] = vn->_normal.x();
 					dst[weightFloats + 3] = vn->_normal.y();
@@ -225,10 +252,10 @@ void PspGuActorRenderer::buildBatches() {
 			const uint32 hwBytes = seamVerts.size() * sizeof(SeamVertHW);
 			const uint32 cpuBytes = seamVerts.size() * sizeof(SeamVertCpuLit);
 
-			SeamVertex *sMem = static_cast<SeamVertex *>(memalign(64, sBytes));
-			uint16 *iMem = static_cast<uint16 *>(memalign(64, iBytes));
-			SeamVertHW *hwMem = static_cast<SeamVertHW *>(memalign(64, hwBytes));
-			SeamVertCpuLit *cpuMem = static_cast<SeamVertCpuLit *>(memalign(64, cpuBytes));
+			SeamVertex *sMem = static_cast<SeamVertex *>(pspGuAllocAlignedWithRetry(64, sBytes));
+			uint16 *iMem = static_cast<uint16 *>(pspGuAllocAlignedWithRetry(64, iBytes));
+			SeamVertHW *hwMem = static_cast<SeamVertHW *>(pspGuAllocAlignedWithRetry(64, hwBytes));
+			SeamVertCpuLit *cpuMem = static_cast<SeamVertCpuLit *>(pspGuAllocAlignedWithRetry(64, cpuBytes));
 			if (!sMem || !iMem || !hwMem || !cpuMem) {
 				free(sMem); free(iMem); free(hwMem); free(cpuMem);
 				warning("PspGuActorRenderer: OOM allocating seam batch");
@@ -345,7 +372,7 @@ void PspGuActorRenderer::buildBatches() {
 						sv.pos1[0] = vn->_pos1.x(); sv.pos1[1] = vn->_pos1.y(); sv.pos1[2] = vn->_pos1.z();
 						sv.pos2[0] = vn->_pos2.x(); sv.pos2[1] = vn->_pos2.y(); sv.pos2[2] = vn->_pos2.z();
 						sv.normal[0] = vn->_normal.x(); sv.normal[1] = vn->_normal.y(); sv.normal[2] = vn->_normal.z();
-						sv.u = vn->_texS;
+						sv.u = mapActorU(vn->_texS);
 						sv.v = vn->_texT;
 						sv.bone1 = (uint16)vn->_bone1;
 						sv.bone2 = (uint16)vn->_bone2;
@@ -649,7 +676,7 @@ void PspGuActorRenderer::render(const Math::Vector3d &position, float direction,
 	if (_castsShadow &&
 	    StarkScene->shouldRenderShadows() &&
 	    StarkSettings->getBoolSetting(Settings::kShadow)) {
-		renderShadowPass(model, position, lights, bones);
+		renderShadowPass(projection, view, model, position, lights, bones);
 	}
 
 	_lastDrawnFrameSeq = _gfx->getFrameSeq();
@@ -747,11 +774,37 @@ struct ShadowVert {
 	float x, y, z;
 };
 
+void applyShadowPassState(const Math::Matrix4 &projection, const Math::Matrix4 &view, const Math::Matrix4 &model) {
+	pspGuLoadMatrix4(GU_PROJECTION, projection);
+	pspGuLoadMatrix4(GU_VIEW, view);
+	pspGuLoadMatrix4(GU_MODEL, model);
+	sceGuDisable(GU_LIGHTING);
+	pspGuDisableAllLights();
+	sceGuDisable(GU_TEXTURE_2D);
+	sceGuEnable(GU_DEPTH_TEST);
+	sceGuDepthMask(GU_TRUE);
+	sceGuEnable(GU_BLEND);
+	sceGuBlendFunc(GU_ADD, GU_SRC_ALPHA, GU_ONE_MINUS_SRC_ALPHA, 0, 0);
+	sceGuEnable(GU_STENCIL_TEST);
+	sceGuStencilFunc(GU_EQUAL, 0, 0xFF);
+	sceGuStencilOp(GU_KEEP, GU_KEEP, GU_INCR);
+	sceGuPixelMask(0x00000000u);
+}
+
 template <typename PosFn>
-void projectAndDrawShadowBatch(PspGuSession *session, const Math::Vector3d &lightDir, float safeDirY,
+void projectAndDrawShadowBatch(PspGuDriver *gfx, PspGuSession *session,
+                               const Math::Matrix4 &projection, const Math::Matrix4 &view, const Math::Matrix4 &model,
+                               const Math::Vector3d &lightDir, float safeDirY,
                                uint32 vertexCount, uint32 indexCount, const uint16 *indices, PosFn getModelPos) {
-	if (vertexCount == 0 || indexCount == 0 || !indices || !session->hasDisplayListHeadroom(128)) {
+	if (!gfx || !session || vertexCount == 0 || indexCount == 0 || !indices) {
 		return;
+	}
+	const uint32 prevSegs = session->getStats().sceneSegments;
+	if (!gfx->ensureSubmissionCapacity(256u, vertexCount * sizeof(ShadowVert), true)) {
+		return;
+	}
+	if (session->getStats().sceneSegments != prevSegs) {
+		applyShadowPassState(projection, view, model);
 	}
 	ShadowVert *sv = static_cast<ShadowVert *>(session->allocVertices(vertexCount * sizeof(ShadowVert), 16));
 	if (!sv) {
@@ -770,11 +823,13 @@ void projectAndDrawShadowBatch(PspGuSession *session, const Math::Vector3d &ligh
 	sceGumDrawArray(GU_TRIANGLES,
 	                GU_COLOR_8888 | GU_VERTEX_32BITF | GU_INDEX_16BIT | GU_TRANSFORM_3D,
 	                (int)indexCount, indices, sv);
+	gfx->recordDrawCall();
 }
 
 } // namespace
 
-void PspGuActorRenderer::renderShadowPass(const Math::Matrix4 &model, const Math::Vector3d &position,
+void PspGuActorRenderer::renderShadowPass(const Math::Matrix4 &projection, const Math::Matrix4 &view,
+                                          const Math::Matrix4 &model, const Math::Vector3d &position,
                                           const Common::Array<Gfx::LightEntry *> &lights,
                                           const Common::Array<BoneNode *> &bones) const {
 	PspGuSession *session = _gfx->getSession();
@@ -787,23 +842,13 @@ void PspGuActorRenderer::renderShadowPass(const Math::Matrix4 &model, const Math
 	const Math::Vector3d lightDir = computeShadowLightDirection(lights, position, modelInverse.getRotation());
 	const float safeDirY = (fabsf(lightDir.y()) > 1e-4f) ? lightDir.y() : -1.0f;
 
-	pspGuLoadMatrix4(GU_MODEL, model);
-	sceGuDisable(GU_LIGHTING);
-	pspGuDisableAllLights();
-	sceGuDisable(GU_TEXTURE_2D);
-	sceGuEnable(GU_DEPTH_TEST);
-	sceGuDepthMask(GU_TRUE);
-	sceGuEnable(GU_BLEND);
-	sceGuBlendFunc(GU_ADD, GU_SRC_ALPHA, GU_ONE_MINUS_SRC_ALPHA, 0, 0);
-	sceGuEnable(GU_STENCIL_TEST);
-	sceGuStencilFunc(GU_EQUAL, 0, 0xFF);
-	sceGuStencilOp(GU_KEEP, GU_KEEP, GU_INCR);
-	sceGuPixelMask(0x00000000u);
+	applyShadowPassState(projection, view, model);
 
 	for (uint32 bi = 0; bi < _rigidBatches.size(); ++bi) {
 		const RigidBatch &rb = _rigidBatches[bi];
 		const uint32 wf = (rb.boneCount > 1) ? rb.boneCount : 0;
-		projectAndDrawShadowBatch(session, lightDir, safeDirY, rb.vertexCount, rb.indexCount, rb.indices,
+		projectAndDrawShadowBatch(_gfx, session, projection, view, model, lightDir, safeDirY,
+		                          rb.vertexCount, rb.indexCount, rb.indices,
 		                          [&](uint32 vi) -> Math::Vector3d {
 			const float *sv = rb.verts + vi * rb.floatStride;
 			uint8 activeSlot = 0;
@@ -823,7 +868,8 @@ void PspGuActorRenderer::renderShadowPass(const Math::Matrix4 &model, const Math
 
 	for (uint32 bi = 0; bi < _seamBatches.size(); ++bi) {
 		const SeamBatch &sb = _seamBatches[bi];
-		projectAndDrawShadowBatch(session, lightDir, safeDirY, sb.vertexCount, sb.indexCount, sb.indices,
+		projectAndDrawShadowBatch(_gfx, session, projection, view, model, lightDir, safeDirY,
+		                          sb.vertexCount, sb.indexCount, sb.indices,
 		                          [&](uint32 vi) -> Math::Vector3d {
 			const SeamVertex &sv = sb.srcVerts[vi];
 			const BoneNode *bn1 = bones[sv.bone1];

@@ -325,9 +325,7 @@ uint32 pspGuEvaluateLightsCpu(const Math::Matrix4 &modelView, const Math::Matrix
 			const float cosAngle = MAX(0.0f, Math::Vector3d::dotProduct(vertexToLight, eyeSpotToLight));
 			const float cosOuter = light->outerConeAngle.getCosine();
 			const float cosInner = light->innerConeAngle.getCosine();
-			const float cone = (cosInner > cosOuter)
-			                   ? CLIP((cosAngle - cosOuter) / MAX(0.001f, cosInner - cosOuter), 0.0f, 1.0f)
-			                   : (cosAngle >= cosOuter ? 1.0f : 0.0f);
+			const float cone = CLIP((cosAngle - cosInner) / MAX(0.001f, cosOuter - cosInner), 0.0f, 1.0f);
 			lightColor += light->color * (attn * incidence * cone);
 			break;
 		}
@@ -624,6 +622,10 @@ void *pspGuAllocAlignedWithRetry(uint32 alignment, uint32 size) {
 	}
 #endif
 	return ptr;
+}
+
+uint32 PspGuDriver::getCurrentFrameSeq() {
+	return s_activeDriver ? s_activeDriver->_frameSeq : 0;
 }
 
 void PspGuDriver::ensureResourceSafeToModify(uint32 drawnFrameSeq) {
@@ -2255,7 +2257,9 @@ void PspGuDriver::trackExternalAuxBytes(int32 deltaBytes) {
 }
 
 void PspGuDriver::onLocationChanged(uint16 level, uint16 location, bool postPurge) {
-	(void)postPurge;
+	if (postPurge) {
+		pspGuReclaimIdleResources(0);
+	}
 	logMemoryAndPacingSnapshot("room", level, location);
 }
 

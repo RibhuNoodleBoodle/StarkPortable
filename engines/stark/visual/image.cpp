@@ -42,7 +42,8 @@ VisualImageXMG::VisualImageXMG(Gfx::Driver *gfx) :
 		_originalHeight(0),
 		_surfaceW(0),
 		_surfaceH(0),
-		_hasSolidMask(false) {
+		_hasSolidMask(false),
+		_keepSurface(false) {
 	_surfaceRenderer = _gfx->createSurfaceRenderer();
 }
 
@@ -59,7 +60,7 @@ VisualImageXMG::~VisualImageXMG() {
 }
 
 void VisualImageXMG::compactSurfaceIfSafe() {
-	if (!_gfx || !_gfx->supportsNativeEffects() || !_surface || !_surface->getPixels()) {
+	if (_keepSurface || !_gfx || !_gfx->supportsNativeEffects() || !_surface || !_surface->getPixels()) {
 		return;
 	}
 	// Preserve full CPU pixels only for small images (e.g. top-bar icons used by Button effects)
@@ -145,6 +146,11 @@ bool VisualImageXMG::loadPNG(Common::SeekableReadStream *stream) {
 		_surface = multiplyColorWithAlpha(pngDecoder.getSurface());
 	} else {
 		_surface = pngDecoder.getSurface()->convertTo(Gfx::Driver::getRGBAPixelFormat());
+	}
+
+	if (_originalWidth == 0 || _originalHeight == 0) {
+		_originalWidth  = _surface->w;
+		_originalHeight = _surface->h;
 	}
 
 	_bitmap = _gfx->createBitmap(_surface);
@@ -259,7 +265,6 @@ int VisualImageXMG::getHeight() const {
 }
 
 const Graphics::Surface *VisualImageXMG::getSurface() const {
-	assert(_surface);
 	return _surface;
 }
 
