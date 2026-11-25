@@ -1,0 +1,266 @@
+/* ScummVM - Graphic Adventure Engine
+ *
+ * ScummVM is the legal property of its developers, whose names
+ * are too numerous to list here. Please refer to the COPYRIGHT
+ * file distributed with this source distribution.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ */
+
+#include "engines/nancy/nancy.h"
+#include "engines/nancy/graphics.h"
+#include "engines/nancy/renderobject.h"
+
+#include "engines/nancy/state/scene.h"
+
+namespace Nancy {
+
+RenderObject::RenderObject(uint16 zOrder) :
+		_needsRedraw(true),
+		_isVisible(true),
+		_z(zOrder),
+		_hasMoved(false) {}
+
+RenderObject::RenderObject(uint16 zOrder, Graphics::ManagedSurface &surface, const Common::Rect &srcBounds, const Common::Rect &destBounds) :
+		RenderObject(zOrder) {
+	_drawSurface.create(surface, srcBounds);
+	_screenPosition = destBounds;
+}
+
+void RenderObject::setZOrder(uint16 z) {
+	if (_z == z) {
+		return;
+	}
+
+	_z = z;
+	_needsRedraw = true;
+	g_nancy->_graphics->reorderObject(this);
+}
+
+const double RenderObject::kNoExactZ = -1e300;
+
+void RenderObject::setExactZ(double z) {
+	if (_exactZ == z) {
+		return;
+	}
+
+	_exactZ = z;
+	_needsRedraw = true;
+	g_nancy->_graphics->reorderObject(this);
+}
+
+void RenderObject::setLayer(int32 layer) {
+	if (_layer == layer) {
+		return;
+	}
+
+	_layer = layer;
+	_needsRedraw = true;
+	g_nancy->_graphics->reorderObject(this);
+}
+
+void RenderObject::init() {
+	_previousScreenPosition = _screenPosition;
+}
+
+void RenderObject::registerGraphics() {
+	g_nancy->_graphics->addObject(this);
+}
+
+RenderObject::~RenderObject() {
+	g_nancy->_graphics->removeObject(this);
+	if (_drawSurface.getPixels()) {
+		_drawSurface.free();
+	}
+}
+
+void RenderObject::moveTo(const Common::Point &position) {
+	// Make sure we don't overwrite the _actual_ last position
+	if (!_hasMoved) {
+		_previousScreenPosition = _screenPosition;
+	}
+
+	_screenPosition.moveTo(position);
+	_needsRedraw = true;
+	_hasMoved = true;
+}
+
+void RenderObject::moveTo(const Common::Rect &bounds) {
+	// Make sure we don't overwrite the _actual_ last position
+	if (!_hasMoved) {
+		_previousScreenPosition = _screenPosition;
+	}
+
+	_screenPosition = bounds;
+	_needsRedraw = true;
+	_hasMoved = true;
+}
+
+void RenderObject::setVisible(bool visible, bool forceRedraw) {
+	if (!forceRedraw && visible == _isVisible) {
+		return;
+	}
+
+	_isVisible = visible;
+	_needsRedraw = true;
+}
+
+void RenderObject::setTransparent(bool isTransparent) {
+	if (isTransparent) {
+		_drawSurface.setTransparentColor(g_nancy->_graphics->getTransColor());
+	} else {
+		_drawSurface.clearTransparentColor();
+	}
+}
+
+void RenderObject::setStencil(bool isStencil) {
+	if (isStencil != _isStencil) {
+		_isStencil = isStencil;
+		_needsRedraw = true;
+	}
+}
+
+void RenderObject::setMasked(bool isMasked) {
+	if (isMasked != _isMasked) {
+		_isMasked = isMasked;
+		_needsRedraw = true;
+	}
+}
+
+void RenderObject::setClipRect(const Common::Rect &clip) {
+	if (clip != _clipRect) {
+		_clipRect = clip;
+		_needsRedraw = true;
+	}
+}
+
+void RenderObject::grabPalette(byte *colors, uint paletteStart, uint paletteSize) {
+	if (colors) {
+		_drawSurface.grabPalette(colors, paletteStart, paletteSize);
+	}
+}
+
+void RenderObject::setPalette(const Common::Path &paletteName, uint paletteStart, uint paletteSize) {
+	GraphicsManager::loadSurfacePalette(_drawSurface, paletteName, paletteStart, paletteSize);
+	_needsRedraw = true;
+}
+
+void RenderObject::setPalette(const byte *colors, uint paletteStart, uint paletteSize) {
+	if (colors) {
+		_drawSurface.setPalette(colors, paletteStart, paletteSize);
+		_needsRedraw = true;
+	}
+}
+
+void RenderObject::addChangedArea(const Common::Rect &area) {
+	if (_changedArea.isEmpty()) {
+		_changedArea = area;
+	} else if (!area.isEmpty()) {
+		_changedArea.extend(area);
+	}
+}
+
+Common::Rect RenderObject::getScreenPosition() const {
+	return convertPositionToScreen(_screenPosition);
+}
+
+Common::Rect RenderObject::getPreviousScreenPosition() const {
+	return convertPositionToScreen(_previousScreenPosition);
+}
+
+Common::Rect RenderObject::convertPositionToScreen(const Common::Rect &position) const {
+	if (!isViewportRelative()) {
+		return position;
+	}
+
+	const UI::Viewport &viewport = NancySceneState.getViewport();
+	Common::Rect ret = position;
+	if (!isMovedByViewportScroll()) {
+		ret.translate(0, viewport.getCurVerticalScroll());
+	}
+	return viewport.convertViewportToScreen(ret);
+}
+
+// Convert a rectangle from screen space to local (to _drawSurface) space.
+// Does NOT take _drawSurface's offset into account
+Common::Rect RenderObject::convertToLocal(const Common::Rect &screen) const {
+	Common::Rect ret = screen;
+	Common::Point offset;
+
+	if (isViewportRelative()) {
+		Common::Rect viewportScreenPos = NancySceneState.getViewport().getScreenPosition();
+		offset.x -= viewportScreenPos.left;
+		offset.y -= viewportScreenPos.top;
+		if (isMovedByViewportScroll()) {
+			offset.y += NancySceneState.getViewport().getCurVerticalScroll();
+		}
+	}
+
+	offset.x -= _screenPosition.left;
+	offset.y -= _screenPosition.top;
+
+	ret.translate(offset.x, offset.y);
+
+	if (_drawSurface.w != _screenPosition.width() || _drawSurface.h != _screenPosition.height()) {
+		Common::Rect srcBounds = _drawSurface.getBounds();
+
+		float scaleX = (float)srcBounds.width() / _screenPosition.width();
+		float scaleY = (float)srcBounds.height() / _screenPosition.height();
+
+		ret.left = (ret.left - srcBounds.left) * scaleX;
+		ret.right = (ret.right - srcBounds.left) * scaleX;
+		ret.top = (ret.top - srcBounds.top) * scaleY;
+		ret.bottom = (ret.bottom - srcBounds.top) * scaleY;
+	}
+
+	return ret;
+}
+
+// Convert rectangle from local (to _drawSurface) space to screen space.
+// Does NOT take _drawSurface's offset into account
+Common::Rect RenderObject::convertToScreen(const Common::Rect &rect) const {
+	Common::Rect ret = rect;
+	Common::Point offset;
+
+	if (_drawSurface.w != _screenPosition.width() || _drawSurface.h != _screenPosition.height()) {
+		Common::Rect srcBounds = _drawSurface.getBounds();
+
+		float scaleX = (float)srcBounds.width() / _screenPosition.width();
+		float scaleY = (float)srcBounds.height() / _screenPosition.height();
+
+		ret.left = (ret.left - srcBounds.left) * scaleX;
+		ret.right = (ret.right - srcBounds.left) * scaleX;
+		ret.top = (ret.top - srcBounds.top) * scaleY;
+		ret.bottom = (ret.bottom - srcBounds.top) * scaleY;
+	}
+
+	if (isViewportRelative()) {
+		Common::Rect viewportScreenPos = NancySceneState.getViewport().getScreenPosition();
+		offset.x += viewportScreenPos.left;
+		offset.y += viewportScreenPos.top;
+		if (isMovedByViewportScroll()) {
+			offset.y -= NancySceneState.getViewport().getCurVerticalScroll();
+		}
+	}
+
+	offset.x += _screenPosition.left;
+	offset.y += _screenPosition.top;
+
+	ret.translate(offset.x, offset.y);
+
+	return ret;
+}
+
+} // End of namespace Nancy
