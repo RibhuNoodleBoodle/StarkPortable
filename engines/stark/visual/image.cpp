@@ -39,17 +39,69 @@ VisualImageXMG::VisualImageXMG(Gfx::Driver *gfx) :
 		_bitmap(nullptr),
 		_surface(nullptr),
 		_originalWidth(0),
-		_originalHeight(0) {
+		_originalHeight(0),
+		_surfaceW(0),
+		_surfaceH(0),
+		_hasSolidMask(false) {
 	_surfaceRenderer = _gfx->createSurfaceRenderer();
 }
 
 VisualImageXMG::~VisualImageXMG() {
+	if (_hasSolidMask && !_solidMask.empty() && _gfx) {
+		_gfx->trackExternalAuxBytes(-(int32)_solidMask.size());
+	}
 	if (_surface) {
 		_surface->free();
 	}
 	delete _surface;
 	delete _bitmap;
 	delete _surfaceRenderer;
+}
+
+void VisualImageXMG::compactSurfaceIfSafe() {
+	if (!_gfx || !_gfx->supportsNativeEffects() || !_surface || !_surface->getPixels()) {
+		return;
+	}
+	// Preserve full CPU pixels only for small images (e.g. top-bar icons used by Button effects)
+	if (_originalWidth <= 96 && _originalHeight <= 96) {
+		return;
+	}
+
+	_surfaceW = (uint16)_surface->w;
+	_surfaceH = (uint16)_surface->h;
+
+	if (_originalWidth >= 32 && _originalHeight >= 32 && _surfaceW > 0 && _surfaceH > 0) {
+		bool allOpaque = true;
+		const uint32 totalPx = (uint32)_surfaceW * (uint32)_surfaceH;
+		for (uint16 y = 0; y < _surfaceH && allOpaque; ++y) {
+			const uint8 *row = (const uint8 *)_surface->getBasePtr(0, y);
+			for (uint16 x = 0; x < _surfaceW; ++x) {
+				if (row[x * 4 + 3] != 0xFF) {
+					allOpaque = false;
+					break;
+				}
+			}
+		}
+		if (!allOpaque) {
+			const uint32 maskBytes = (totalPx + 7u) >> 3;
+			_solidMask.resize(maskBytes, 0);
+			uint32 bitIdx = 0;
+			for (uint16 y = 0; y < _surfaceH; ++y) {
+				const uint8 *row = (const uint8 *)_surface->getBasePtr(0, y);
+				for (uint16 x = 0; x < _surfaceW; ++x, ++bitIdx) {
+					if (row[x * 4 + 3] == 0xFF) {
+						_solidMask[bitIdx >> 3] |= (uint8)(1u << (bitIdx & 7u));
+					}
+				}
+			}
+			_gfx->trackExternalAuxBytes((int32)_solidMask.size());
+		}
+		_hasSolidMask = true;
+	}
+
+	_surface->free();
+	delete _surface;
+	_surface = nullptr;
 }
 
 void VisualImageXMG::setHotSpot(const Common::Point &hotspot) {
@@ -66,6 +118,7 @@ void VisualImageXMG::load(Common::ReadStream *stream) {
 
 	_originalWidth  = _surface->w;
 	_originalHeight = _surface->h;
+	compactSurfaceIfSafe();
 }
 
 void VisualImageXMG::readOriginalSize(Common::ReadStream *stream) {
@@ -96,6 +149,7 @@ bool VisualImageXMG::loadPNG(Common::SeekableReadStream *stream) {
 
 	_bitmap = _gfx->createBitmap(_surface);
 	_bitmap->setSamplingFilter(StarkSettings->getImageSamplingFilter());
+	compactSurfaceIfSafe();
 
 	return true;
 }
@@ -167,17 +221,29 @@ void VisualImageXMG::setFadeLevel(float fadeLevel) {
 }
 
 bool VisualImageXMG::isPointSolid(const Common::Point &point) const {
-	assert(_surface);
-
 	if (_originalWidth < 32 || _originalHeight < 32) {
 		return true; // Small images are always solid
 	}
 
+	if (!_surface && _hasSolidMask) {
+		if (_solidMask.empty() || _surfaceW == 0 || _surfaceH == 0) {
+			return true;
+		}
+		uint16 sx = (uint16)(point.x * _surfaceW / _originalWidth);
+		uint16 sy = (uint16)(point.y * _surfaceH / _originalHeight);
+		sx = CLIP<uint16>(sx, 0, _surfaceW - 1);
+		sy = CLIP<uint16>(sy, 0, _surfaceH - 1);
+		const uint32 bitIdx = (uint32)sy * _surfaceW + sx;
+		return (_solidMask[bitIdx >> 3] & (1u << (bitIdx & 7u))) != 0;
+	}
+
+	assert(_surface);
+
 	Common::Point scaledPoint;
 	scaledPoint.x = point.x * _surface->w / _originalWidth;
 	scaledPoint.y = point.y * _surface->h / _originalHeight;
-	scaledPoint.x = CLIP<uint16>(scaledPoint.x, 0, _surface->w);
-	scaledPoint.y = CLIP<uint16>(scaledPoint.y, 0, _surface->h);
+	scaledPoint.x = CLIP<uint16>(scaledPoint.x, 0, _surface->w - 1);
+	scaledPoint.y = CLIP<uint16>(scaledPoint.y, 0, _surface->h - 1);
 
 	// Maybe implement this method in some other way to avoid having to keep the surface in memory
 	const byte *ptr = (const byte *) _surface->getBasePtr(scaledPoint.x, scaledPoint.y);

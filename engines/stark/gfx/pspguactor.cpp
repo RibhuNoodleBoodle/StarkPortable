@@ -512,6 +512,14 @@ void PspGuActorRenderer::render(const Math::Vector3d &position, float direction,
 	// 1. Static hardware-skinned rigid batches (1-bone direct model*bone, or 2..8-bone sceGuBoneMatrix)
 	for (uint32 bi = 0; bi < _rigidBatches.size(); ++bi) {
 		const RigidBatch &rb = _rigidBatches[bi];
+		const uint32 prevSegs = _gfx->getSession() ? _gfx->getSession()->getStats().sceneSegments : 0;
+		if (!_gfx->ensureSubmissionCapacity(512u, 0u, true)) {
+			break;
+		}
+		if (_gfx->getSession() && _gfx->getSession()->getStats().sceneSegments != prevSegs) {
+			pspGuLoadMatrix4(GU_PROJECTION, projection);
+			pspGuLoadMatrix4(GU_VIEW, view);
+		}
 		Math::Vector3d baseRgb;
 		bindMaterialAndLights(rb.materialId, baseRgb);
 
@@ -528,6 +536,7 @@ void PspGuActorRenderer::render(const Math::Vector3d &position, float direction,
 				}
 			}
 			sceGumDrawArray(GU_TRIANGLES, rb.vtype, (int)rb.indexCount, rb.indices, rb.verts);
+			_gfx->recordDrawCall();
 		} else {
 			if (_rigidCpuScratchCap < rb.vertexCount) {
 				if (_rigidCpuScratch) {
@@ -572,6 +581,7 @@ void PspGuActorRenderer::render(const Math::Vector3d &position, float direction,
 				sceGumDrawArray(GU_TRIANGLES,
 				                GU_TEXTURE_32BITF | GU_COLOR_8888 | GU_VERTEX_32BITF | GU_INDEX_16BIT | GU_TRANSFORM_3D,
 				                (int)rb.indexCount, rb.indices, _rigidCpuScratch);
+				_gfx->recordDrawCall();
 			}
 		}
 	}
@@ -581,6 +591,15 @@ void PspGuActorRenderer::render(const Math::Vector3d &position, float direction,
 		pspGuLoadMatrix4(GU_MODEL, model);
 		for (uint32 bi = 0; bi < _seamBatches.size(); ++bi) {
 			const SeamBatch &sb = _seamBatches[bi];
+			const uint32 prevSegs = _gfx->getSession() ? _gfx->getSession()->getStats().sceneSegments : 0;
+			if (!_gfx->ensureSubmissionCapacity(512u, 0u, true)) {
+				break;
+			}
+			if (_gfx->getSession() && _gfx->getSession()->getStats().sceneSegments != prevSegs) {
+				pspGuLoadMatrix4(GU_PROJECTION, projection);
+				pspGuLoadMatrix4(GU_VIEW, view);
+				pspGuLoadMatrix4(GU_MODEL, model);
+			}
 			Math::Vector3d baseRgb;
 			bindMaterialAndLights(sb.materialId, baseRgb);
 
@@ -588,6 +607,7 @@ void PspGuActorRenderer::render(const Math::Vector3d &position, float direction,
 				sceGumDrawArray(GU_TRIANGLES,
 				                GU_TEXTURE_32BITF | GU_NORMAL_32BITF | GU_VERTEX_32BITF | GU_INDEX_16BIT | GU_TRANSFORM_3D,
 				                (int)sb.indexCount, sb.indices, sb.dynHwVerts);
+				_gfx->recordDrawCall();
 			} else {
 				for (uint32 vi = 0; vi < sb.vertexCount; ++vi) {
 					const SeamVertex &sv = sb.srcVerts[vi];
@@ -618,6 +638,7 @@ void PspGuActorRenderer::render(const Math::Vector3d &position, float direction,
 				sceGumDrawArray(GU_TRIANGLES,
 				                GU_TEXTURE_32BITF | GU_COLOR_8888 | GU_VERTEX_32BITF | GU_INDEX_16BIT | GU_TRANSFORM_3D,
 				                (int)sb.indexCount, sb.indices, sb.dynCpuVerts);
+				_gfx->recordDrawCall();
 			}
 		}
 	}

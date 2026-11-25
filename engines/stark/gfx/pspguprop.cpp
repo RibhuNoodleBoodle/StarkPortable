@@ -23,6 +23,7 @@
 
 #include "engines/stark/gfx/pspguprop.h"
 #include "engines/stark/gfx/pspgu.h"
+#include "backends/platform/psp/psp_gu_session.h"
 #include "engines/stark/gfx/pspgutexture.h"
 
 #include <malloc.h>
@@ -256,6 +257,18 @@ void PspGuPropRenderer::render(const Math::Vector3d &position, float direction, 
 		const Batch &b = _batches[bi];
 		const Material &mat = materials[b.materialId];
 		const Texture *tex = _texture ? _texture->getTexture(mat.texture) : nullptr;
+		const Math::Vector3d baseRgb = tex ? Math::Vector3d(1.0f, 1.0f, 1.0f)
+		                                   : Math::Vector3d(mat.r, mat.g, mat.b);
+
+		const uint32 prevSplits = _gfx->getSession() ? _gfx->getSession()->getStats().sceneSegments : 0;
+		if (!_gfx->ensureSubmissionCapacity(512u, 0u, true)) {
+			break;
+		}
+		if (_gfx->getSession() && _gfx->getSession()->getStats().sceneSegments != prevSplits) {
+			pspGuLoadMatrix4(GU_PROJECTION, projection);
+			pspGuLoadMatrix4(GU_VIEW, view);
+			pspGuLoadMatrix4(GU_MODEL, model);
+		}
 
 		if (tex) {
 			tex->bind();
@@ -265,14 +278,12 @@ void PspGuPropRenderer::render(const Math::Vector3d &position, float direction, 
 			sceGuDisable(GU_TEXTURE_2D);
 		}
 
-		const Math::Vector3d baseRgb = tex ? Math::Vector3d(1.0f, 1.0f, 1.0f)
-		                                   : Math::Vector3d(mat.r, mat.g, mat.b);
-
 		if (hwLights) {
 			pspGuSetupLightingOrCpuMode(lights, baseRgb);
 			sceGumDrawArray(GU_TRIANGLES,
 			                GU_TEXTURE_32BITF | GU_NORMAL_32BITF | GU_VERTEX_32BITF | GU_INDEX_16BIT | GU_TRANSFORM_3D,
 			                (int)b.indexCount, b.indices, b.verts);
+			_gfx->recordDrawCall();
 		} else {
 			sceGuDisable(GU_LIGHTING);
 			pspGuDisableAllLights();
@@ -307,6 +318,7 @@ void PspGuPropRenderer::render(const Math::Vector3d &position, float direction, 
 				sceGumDrawArray(GU_TRIANGLES,
 				                GU_TEXTURE_32BITF | GU_COLOR_8888 | GU_VERTEX_32BITF | GU_INDEX_16BIT | GU_TRANSFORM_3D,
 				                (int)b.indexCount, b.indices, _cpuLitScratch);
+				_gfx->recordDrawCall();
 			}
 		}
 	}

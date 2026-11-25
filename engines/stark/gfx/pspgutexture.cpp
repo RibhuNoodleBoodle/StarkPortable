@@ -156,7 +156,7 @@ void PspGuTexture::addLevel(uint32 level, const Graphics::Surface *surface, cons
 		                isPow2U32((uint32)surface->w) && isPow2U32((uint32)surface->h));
 		if (_isIndexedT8) {
 			_clutBytes = 256 * sizeof(uint32);
-			_clut = static_cast<uint32 *>(memalign(64, _clutBytes));
+			_clut = static_cast<uint32 *>(pspGuAllocAlignedWithRetry(64, _clutBytes));
 			if (!_clut) {
 				_clutBytes = 0;
 				_isIndexedT8 = false;
@@ -180,20 +180,25 @@ void PspGuTexture::addLevel(uint32 level, const Graphics::Surface *surface, cons
 	const uint16 dstW = MAX<uint16>(1, _baseWidth >> level);
 	const uint16 dstH = MAX<uint16>(1, _baseHeight >> level);
 
-	if (_levels[level].data) {
-		pspGuTrackTextureBytes(-(int32)_levels[level].byteSize);
-		free(_levels[level].data);
-		memset(&_levels[level], 0, sizeof(MipLevel));
-	}
-
 	if (_isIndexedT8 && palette && surface->format.bytesPerPixel == 1 &&
 	    (uint32)surface->w == dstW && (uint32)surface->h == dstH) {
 		const uint16 stride = MAX<uint16>(16, dstW);
 		const uint32 byteSize = (uint32)stride * (uint32)dstH;
-		uint8 *data = static_cast<uint8 *>(memalign(64, byteSize));
+		uint8 *data = static_cast<uint8 *>(pspGuAllocAlignedWithRetry(64, byteSize));
 		if (!data) {
 			warning("PspGuTexture: OOM allocating T8 mip %u (%ux%u, %u bytes)", level, stride, dstH, byteSize);
+			if (level == 0 && _uploadedLevels == 0) {
+				releaseClut();
+				_isIndexedT8 = false;
+				_baseWidth = 0;
+				_baseHeight = 0;
+			}
 			return;
+		}
+		if (_levels[level].data) {
+			pspGuTrackTextureBytes(-(int32)_levels[level].byteSize);
+			free(_levels[level].data);
+			memset(&_levels[level], 0, sizeof(MipLevel));
 		}
 		for (uint16 row = 0; row < dstH; ++row) {
 			memcpy(data + (uint32)row * stride, surface->getBasePtr(0, row), dstW);
@@ -219,10 +224,20 @@ void PspGuTexture::addLevel(uint32 level, const Graphics::Surface *surface, cons
 
 	const uint16 stride = MAX<uint16>(4, dstW);
 	const uint32 byteSize = (uint32)stride * (uint32)dstH * sizeof(uint32);
-	uint32 *pixels = static_cast<uint32 *>(memalign(64, byteSize));
+	uint32 *pixels = static_cast<uint32 *>(pspGuAllocAlignedWithRetry(64, byteSize));
 	if (!pixels) {
 		warning("PspGuTexture: OOM allocating mip %u (%ux%u, %u bytes)", level, stride, dstH, byteSize);
+		if (level == 0 && _uploadedLevels == 0) {
+			releaseClut();
+			_baseWidth = 0;
+			_baseHeight = 0;
+		}
 		return;
+	}
+	if (_levels[level].data) {
+		pspGuTrackTextureBytes(-(int32)_levels[level].byteSize);
+		free(_levels[level].data);
+		memset(&_levels[level], 0, sizeof(MipLevel));
 	}
 
 	if ((uint32)surface->w == dstW && (uint32)surface->h == dstH) {

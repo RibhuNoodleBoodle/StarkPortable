@@ -121,9 +121,37 @@ const uint32 *PspGuBitmap::getAlphaFadeClut() {
 	return s_alphaClut;
 }
 
+namespace {
+
+Common::Array<PspGuBitmap *> &getLiveBitmapsRegistry() {
+	static Common::Array<PspGuBitmap *> s_liveBitmaps;
+	return s_liveBitmaps;
+}
+
+} // namespace
+
+uint32 PspGuBitmap::reclaimIdleAlphaMasks(uint32 currentFrameSeq, uint32 minBytes) {
+	Common::Array<PspGuBitmap *> &reg = getLiveBitmapsRegistry();
+	uint32 reclaimed = 0;
+	for (uint32 i = 0; i < reg.size(); ++i) {
+		PspGuBitmap *bmp = reg[i];
+		if (!bmp) {
+			continue;
+		}
+		if (bmp->_lastDrawnFrameSeq == 0 || bmp->_lastDrawnFrameSeq + 2 < currentFrameSeq) {
+			reclaimed += bmp->releaseAlphaMasks();
+			if (minBytes > 0 && reclaimed >= minBytes) {
+				break;
+			}
+		}
+	}
+	return reclaimed;
+}
+
 PspGuBitmap::PspGuBitmap(const Graphics::Surface *surface, const byte *palette) :
 		_samplingFilter(kLinear),
 		_lastDrawnFrameSeq(0) {
+	getLiveBitmapsRegistry().push_back(this);
 	if (surface) {
 		update(surface, palette);
 	}
@@ -131,7 +159,28 @@ PspGuBitmap::PspGuBitmap(const Graphics::Surface *surface, const byte *palette) 
 
 PspGuBitmap::~PspGuBitmap() {
 	PspGuDriver::ensureResourceSafeToModify(_lastDrawnFrameSeq);
+	Common::Array<PspGuBitmap *> &reg = getLiveBitmapsRegistry();
+	for (uint32 i = 0; i < reg.size(); ++i) {
+		if (reg[i] == this) {
+			reg.remove_at(i);
+			break;
+		}
+	}
 	releaseTiles();
+}
+
+uint32 PspGuBitmap::releaseAlphaMasks() {
+	uint32 freed = 0;
+	for (uint32 i = 0; i < _tiles.size(); ++i) {
+		if (_tiles[i].alphaMask) {
+			pspGuTrackAuxBytes(-(int32)_tiles[i].alphaByteSize);
+			free(_tiles[i].alphaMask);
+			freed += _tiles[i].alphaByteSize;
+			_tiles[i].alphaMask = nullptr;
+			_tiles[i].alphaByteSize = 0;
+		}
+	}
+	return freed;
 }
 
 void PspGuBitmap::releaseTiles() {
@@ -222,7 +271,7 @@ void PspGuBitmap::update(const Graphics::Surface *surface, const byte *palette) 
 				t.stride = MAX<uint16>(16, t.texW);
 				t.psm = targetPsm;
 				t.byteSize = (uint32)t.stride * (uint32)t.texH * bpp;
-				t.pixels = memalign(64, t.byteSize);
+				t.pixels = pspGuAllocAlignedWithRetry(64, t.byteSize);
 				t.alphaMask = nullptr;
 				t.alphaByteSize = 0;
 
@@ -289,6 +338,15 @@ void PspGuBitmap::buildAlphaMaskForTile(Tile &tile) const {
 				d[col] = (uint8)(s[col] >> 24);
 			}
 		}
+	} else if (tile.psm == GU_PSM_4444) {
+		const uint16 *src = static_cast<const uint16 *>(tile.pixels);
+		for (uint32 row = 0; row < tile.texH; ++row) {
+			const uint16 *s = src + row * tile.stride;
+			uint8 *d = tile.alphaMask + row * tile.stride;
+			for (uint32 col = 0; col < tile.texW; ++col) {
+				d[col] = (uint8)(((s[col] >> 12) & 0xFu) * 17u);
+			}
+		}
 	} else if (tile.psm == GU_PSM_5551) {
 		const uint16 *src = static_cast<const uint16 *>(tile.pixels);
 		for (uint32 row = 0; row < tile.texH; ++row) {
@@ -312,7 +370,7 @@ bool PspGuBitmap::ensureAlphaMasks() const {
 		}
 		if (!t.alphaMask) {
 			const uint32 sz = (uint32)t.stride * (uint32)t.texH;
-			t.alphaMask = static_cast<uint8 *>(memalign(64, sz));
+			t.alphaMask = static_cast<uint8 *>(pspGuAllocAlignedWithRetry(64, sz));
 			if (!t.alphaMask) {
 				return false;
 			}

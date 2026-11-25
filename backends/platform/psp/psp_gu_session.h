@@ -117,6 +117,14 @@ public:
 
 	uint32 getDisplayListBytesUsed() const;
 	bool hasDisplayListHeadroom(uint32 neededBytes = 0) const;
+	uint32 getVertexOffset() const { return _vertexOffset; }
+	bool hasVertexHeadroom(uint32 neededBytes, uint32 alignment = 16) const {
+		if (!_frameOpen) {
+			return false;
+		}
+		const uint32 aligned = (_vertexOffset + alignment - 1) & ~(alignment - 1);
+		return aligned <= kVertexArenaSize && neededBytes <= kVertexArenaSize - aligned;
+	}
 
 	/** Prime unused 512x256 padding texels outside 320x240 with a debug sentinel color. */
 	void primeScenePadding(uint32 sentinelAbgr);

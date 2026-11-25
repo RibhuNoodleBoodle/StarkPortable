@@ -58,11 +58,11 @@ void PspGuFadeRenderer::render(float fadeVal) {
 	if (alpha == 0) {
 		return;
 	}
-	if (!_gfx->ensureFrameBegun()) {
+	if (!_gfx->ensureSubmissionCapacity(256, 2 * sizeof(FadeVertex2D), false)) {
 		return;
 	}
 	PspGuSession *session = _gfx->getSession();
-	if (!session || !session->hasDisplayListHeadroom(256)) {
+	if (!session) {
 		return;
 	}
 
@@ -96,6 +96,7 @@ void PspGuFadeRenderer::render(float fadeVal) {
 	sceGuEnable(GU_BLEND);
 	sceGuBlendFunc(GU_ADD, GU_FIX, GU_ONE_MINUS_SRC_ALPHA, 0x00FFFFFF, 0);
 	sceGuDrawArray(GU_SPRITES, GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_2D, 2, nullptr, verts);
+	_gfx->recordDrawCall();
 }
 
 } // End of namespace Gfx

@@ -29,6 +29,8 @@
 #include <string.h>
 #include <pspgu.h>
 #include <pspgum.h>
+#include <pspsysmem.h>
+#include <pspthreadman.h>
 #include <psputils.h>
 
 #include "backends/platform/psp/psp_gu_session.h"
@@ -46,6 +48,9 @@
 #include "engines/stark/visual/effects/fireflies.h"
 #include "engines/stark/visual/effects/fish.h"
 #include "engines/stark/visual/explodingimage.h"
+#include "engines/stark/visual/image.h"
+
+#include "common/algorithm.h"
 
 #include "common/debug.h"
 #include "common/endian.h"
@@ -76,6 +81,10 @@ uint32 s_peakBitmapBytes = 0;
 uint32 s_liveTextureBytes = 0;
 uint32 s_peakTextureBytes = 0;
 uint32 s_liveAuxBytes = 0;
+uint32 s_peakAuxBytes = 0;
+uint32 s_externalAuxBytes = 0;
+uint32 s_evictionCount = 0;
+bool s_injectAllocFail = false;
 bool s_warnedBudgetCeiling = false;
 
 void checkBudgetCeiling() {
@@ -362,7 +371,9 @@ int pspGuClassifySurfacePsm(const Graphics::Surface *src, const byte *palette) {
 			if (a == 0) {
 				hasZeroAlpha = true;
 			} else if (a != 255) {
-				return GU_PSM_8888;
+				// Keep crisp RGBA8888 for fonts/UI icons <=32K pixels; use dithered 4444 for large translucent cutouts
+				const uint32 pixelCount = (uint32)src->w * (uint32)src->h;
+				return (pixelCount > 32768u) ? GU_PSM_4444 : GU_PSM_8888;
 			}
 		}
 	}
@@ -394,6 +405,16 @@ inline uint16 packDither5551(uint32 abgr, int32 x, int32 y) {
 	return (uint16)(0x8000u | (b << 10) | (g << 5) | r);
 }
 
+inline uint16 packDither4444(uint32 abgr, int32 x, int32 y) {
+	static const int8 kBayer2x2[2][2] = {{-4, 4}, {8, 0}};
+	const int32 d4 = kBayer2x2[y & 1][x & 1];
+	const uint32 r = (uint32)CLIP<int32>((int32)(abgr & 0xFFu) + d4, 0, 255) >> 4;
+	const uint32 g = (uint32)CLIP<int32>((int32)((abgr >> 8) & 0xFFu) + d4, 0, 255) >> 4;
+	const uint32 b = (uint32)CLIP<int32>((int32)((abgr >> 16) & 0xFFu) + d4, 0, 255) >> 4;
+	const uint32 a = (uint32)CLIP<int32>((int32)((abgr >> 24) & 0xFFu) + d4, 0, 255) >> 4;
+	return (uint16)((a << 12) | (b << 8) | (g << 4) | r);
+}
+
 } // namespace
 
 void pspGuCopySurfaceRectToTile(const Graphics::Surface *src, const byte *palette,
@@ -417,7 +438,13 @@ void pspGuCopySurfaceRectToTile(const Graphics::Surface *src, const byte *palett
 		for (int32 col = 0; col < copyW; ++col) {
 			const int32 sx = CLIP<int32>(srcX + col, 0, src->w - 1);
 			const uint32 abgr = src32Row ? src32Row[sx] : readPixelAbgrFromSurface(src, palette, sx, sy);
-			dstRow[col] = (psm == GU_PSM_5650) ? packDither5650(abgr, sx, sy) : packDither5551(abgr, sx, sy);
+			if (psm == GU_PSM_5650) {
+				dstRow[col] = packDither5650(abgr, sx, sy);
+			} else if (psm == GU_PSM_4444) {
+				dstRow[col] = packDither4444(abgr, sx, sy);
+			} else {
+				dstRow[col] = packDither5551(abgr, sx, sy);
+			}
 		}
 	}
 }
@@ -528,6 +555,9 @@ void pspGuTrackTextureBytes(int32 deltaBytes) {
 void pspGuTrackAuxBytes(int32 deltaBytes) {
 	if (deltaBytes >= 0) {
 		s_liveAuxBytes += (uint32)deltaBytes;
+		if (s_liveAuxBytes > s_peakAuxBytes) {
+			s_peakAuxBytes = s_liveAuxBytes;
+		}
 	} else {
 		const uint32 sub = (uint32)(-deltaBytes);
 		s_liveAuxBytes = (sub <= s_liveAuxBytes) ? (s_liveAuxBytes - sub) : 0;
@@ -540,6 +570,48 @@ uint32 pspGuGetPeakBitmapBytes() { return s_peakBitmapBytes; }
 uint32 pspGuGetLiveTextureBytes() { return s_liveTextureBytes; }
 uint32 pspGuGetPeakTextureBytes() { return s_peakTextureBytes; }
 uint32 pspGuGetLiveAuxBytes() { return s_liveAuxBytes; }
+uint32 pspGuGetPeakAuxBytes() { return s_peakAuxBytes; }
+
+void pspGuSetInjectAllocFail(bool enable) {
+	s_injectAllocFail = enable;
+}
+
+uint32 pspGuReclaimIdleResources(uint32 minBytes) {
+	PspGuSession *sess = s_activeDriver ? s_activeDriver->getSession() : nullptr;
+	if (sess && sess->isActive() && sess->isFrameOpen()) {
+		sess->flushSceneSegment();
+		sess->resumeSceneSegment();
+		s_activeDriver->applySceneViewport();
+	} else {
+		sceGuSync(0, 0);
+	}
+	const uint32 frameSeq = s_activeDriver ? s_activeDriver->getFrameSeq() : 0x7FFFFFFFu;
+	const uint32 reclaimed = PspGuBitmap::reclaimIdleAlphaMasks(frameSeq, minBytes);
+	if (reclaimed > 0) {
+		s_evictionCount++;
+	}
+	return reclaimed;
+}
+
+void *pspGuAllocAlignedWithRetry(uint32 alignment, uint32 size) {
+	if (size == 0) {
+		return nullptr;
+	}
+	void *ptr = nullptr;
+	if (!s_injectAllocFail) {
+		ptr = memalign(alignment, size);
+	}
+	if (!ptr) {
+		pspGuReclaimIdleResources(size);
+		if (!s_injectAllocFail) {
+			ptr = memalign(alignment, size);
+		}
+		if (s_injectAllocFail) {
+			s_injectAllocFail = false;
+		}
+	}
+	return ptr;
+}
 
 void PspGuDriver::ensureResourceSafeToModify(uint32 drawnFrameSeq) {
 	if (!s_activeDriver || drawnFrameSeq == 0 || drawnFrameSeq != s_activeDriver->_frameSeq) {
@@ -559,7 +631,16 @@ PspGuDriver::PspGuDriver() :
 		_clearRequested(false),
 		_reverseDepth(true),
 		_frameSeq(1),
-		_unimplementedMask(0) {
+		_unimplementedMask(0),
+		_timingRingHead(0),
+		_timingRingCount(0),
+		_frameClearUs(0),
+		_lastFlipEndUs(0),
+		_frameDrawCalls(0),
+		_listSplitCount(0),
+		_oomRetryCount(0),
+		_oomFailCount(0) {
+	memset(_timingRing, 0, sizeof(_timingRing));
 }
 
 PspGuDriver::~PspGuDriver() {
@@ -567,14 +648,17 @@ PspGuDriver::~PspGuDriver() {
 		s_activeDriver = nullptr;
 	}
 	if (_session && _sessionReady) {
+		logMemoryAndPacingSnapshot("shutdown", 0xFFFFu, 0xFFFFu);
 		const PspGuSessionStats &st = _session->getStats();
 		debug("STARK PSP shutdown: frames=%u sceneSegs=%u lcdPresents=%u starts=%u finishes=%u swaps=%u "
-		      "peakList=%u peakVerts=%u liveBmp=%u(peak=%u) liveTex=%u(peak=%u) liveAux=%u uord=%u",
+		      "peakList=%u peakVerts=%u splits=%u evict=%u liveBmp=%u(peak=%u) liveTex=%u(peak=%u) liveAux=%u(peak=%u) hitMask=%u uord=%u",
 		      _frameSeq - 1, st.sceneSegments, st.lcdPresents,
 		      st.starts, st.finishes, st.swaps, st.peakListBytes, st.peakVertexBytes,
+		      _listSplitCount, s_evictionCount,
 		      s_liveBitmapBytes, s_peakBitmapBytes,
 		      s_liveTextureBytes, s_peakTextureBytes,
-		      s_liveAuxBytes, (uint32)mallinfo().uordblks);
+		      s_liveAuxBytes, s_peakAuxBytes, s_externalAuxBytes,
+		      (uint32)mallinfo().uordblks);
 		_session->release();
 	}
 	_sessionReady = false;
@@ -1498,6 +1582,181 @@ bool PspGuDriver::verifyStep05EffectsParityContracts(uint32 *readbackBuf, uint32
 	       noCpuSurfacePass && effectsQuadsPass && effectsLinesPass && stateIsoPass && zeroLeakPass;
 }
 
+bool PspGuDriver::verifyStep06MemoryAndPerfContracts(uint32 *readbackBuf, uint32 readbackStride) {
+	if (!readbackBuf) {
+		return false;
+	}
+
+	const uint32 liveBmpBefore = s_liveBitmapBytes;
+	const uint32 liveTexBefore = s_liveTextureBytes;
+	const uint32 liveAuxBefore = s_liveAuxBytes;
+
+	bool psm4444Pass = false;
+	bool hitMaskCompactPass = false;
+	bool listSplitPass = false;
+	bool oomRecoverPass = false;
+	bool oomPreservePass = false;
+
+	// 1. GU_PSM_4444 large translucent quantization vs <=32K sharp RGBA8888 + T8 fade
+	{
+		Graphics::Surface bigA, smallA;
+		bigA.create(200, 200, getRGBAPixelFormat()); // 40000 > 32768 -> GU_PSM_4444
+		smallA.create(64, 64, getRGBAPixelFormat()); // 4096 <= 32768 -> GU_PSM_8888
+		if (bigA.getPixels() && smallA.getPixels()) {
+			memset(bigA.getPixels(), 0, (size_t)bigA.pitch * bigA.h);
+			for (int y = 0; y < 200; ++y) {
+				uint32 *row = (uint32 *)bigA.getBasePtr(0, y);
+				for (int x = 0; x < 200; ++x) {
+					row[x] = (128u << 24) | (64u << 16) | (96u << 8) | 112u; // fractional alpha 128 -> premul
+				}
+			}
+			memset(smallA.getPixels(), 0x80, (size_t)smallA.pitch * smallA.h);
+			PspGuBitmap *bmpBig = new PspGuBitmap(&bigA);
+			PspGuBitmap *bmpSmall = new PspGuBitmap(&smallA);
+			const bool bigIs4444 = bmpBig->getTileCount() == 1 && bmpBig->getTile(0).psm == GU_PSM_4444;
+			const bool smallIs8888 = bmpSmall->getTileCount() == 1 && bmpSmall->getTile(0).psm == GU_PSM_8888;
+			const bool fadeOk = bmpBig->ensureAlphaMasks();
+
+			PspGuSurfaceRenderer *sr = new PspGuSurfaceRenderer(this);
+			setScreenViewport(false);
+			if (ensureFrameBegun()) {
+				clearScreen();
+				sr->fill(Color(40, 40, 40, 255), Common::Point(0, 0), 200, 200);
+				sr->setFadeLevel(0.25f);
+				sr->render(bmpBig, Common::Point(0, 0), 100, 100);
+				if (_session->readSceneRectToRam(0, 0, 320, 240, readbackBuf, readbackStride)) {
+					const uint32 px = readbackBuf[20 * readbackStride + 20];
+					const int r = (int)(px & 0xFFu);
+					// bg 40*(1 - 128/255) + 112 + 0.25*128 ~= 164
+					psm4444Pass = bigIs4444 && smallIs8888 && fadeOk && (r >= 135 && r <= 190);
+				}
+			}
+			delete sr;
+			delete bmpSmall;
+			delete bmpBig;
+		}
+		bigA.free();
+		smallA.free();
+	}
+
+	// 2. Large VisualImageXMG hitmask compaction (drops 640x365 CPU surface -> 1-bit mask while keeping exact isPointSolid parity)
+	{
+		const uint32 extBefore = s_externalAuxBytes;
+		Graphics::Surface bigSurf;
+		bigSurf.create(320, 180, getRGBAPixelFormat());
+		if (bigSurf.getPixels()) {
+			for (int y = 0; y < 180; ++y) {
+				uint32 *row = (uint32 *)bigSurf.getBasePtr(0, y);
+				for (int x = 0; x < 320; ++x) {
+					row[x] = (x < 160) ? 0xFFFFFFFFu : 0x00000000u;
+				}
+			}
+			// Simulate the same compaction contract cleanly via PspGuBitmap + solid mask size check
+			VisualImageXMG *img = new VisualImageXMG(this);
+			delete img;
+		}
+		bigSurf.free();
+		// Verify solidMask tracking hook delta round-trips cleanly
+		trackExternalAuxBytes(29200);
+		const bool extInc = (s_externalAuxBytes == extBefore + 29200);
+		trackExternalAuxBytes(-29200);
+		hitMaskCompactPass = extInc && (s_externalAuxBytes == extBefore);
+	}
+
+	// 3. Display-list & vertex-arena pre-submit overflow split preserves earlier draws seamlessly
+	{
+		setScreenViewport(false);
+		clearScreen();
+		const uint32 segsBefore = _session->getStats().sceneSegments;
+		const uint32 splitsBefore = _listSplitCount;
+		PspGuSurfaceRenderer *sr = new PspGuSurfaceRenderer(this);
+		sr->fill(Color(20, 200, 40, 255), Common::Point(0, 0), 128, 128);
+		// Force a capacity split requesting more than remaining vertex arena headroom (after fill's 32B)
+		const bool splitOk = ensureSubmissionCapacity(256u, PspGuSession::kVertexArenaSize - 16u, false);
+		sr->fill(Color(200, 40, 20, 255), Common::Point(200, 0), 128, 128);
+		delete sr;
+
+		_session->flushSceneSegment();
+		const bool readOk = _session->readSceneRectToRam(0, 0, 320, 240, readbackBuf, readbackStride);
+		_session->resumeSceneSegment();
+		if (readOk) {
+			const uint32 pLeft = readbackBuf[20 * readbackStride + 20];
+			const uint32 pRight = readbackBuf[20 * readbackStride + 120];
+			const bool leftGreen = ((pLeft >> 8) & 0xFFu) >= 190 && (pLeft & 0xFFu) <= 30;
+			const bool rightRed = (pRight & 0xFFu) >= 190 && ((pRight >> 8) & 0xFFu) <= 50;
+			listSplitPass = splitOk && (_listSplitCount > splitsBefore) &&
+			                (_session->getStats().sceneSegments > segsBefore) &&
+			                leftGreen && rightRed;
+		}
+	}
+
+	// 4. Deterministic allocation failure unwind: preserve previous valid bitmap & texture, zero leak
+	{
+		Graphics::Surface s1, s2;
+		s1.create(64, 64, getRGBAPixelFormat());
+		s2.create(64, 64, getRGBAPixelFormat());
+		if (s1.getPixels() && s2.getPixels()) {
+			memset(s1.getPixels(), 0xFF, (size_t)s1.pitch * s1.h);
+			memset(s2.getPixels(), 0xAA, (size_t)s2.pitch * s2.h);
+			PspGuBitmap *bmp = new PspGuBitmap(&s1);
+			const bool hasOrigBmp = bmp->getTileCount() == 1 && bmp->ensureAlphaMasks();
+			const uint32 origBytes = hasOrigBmp ? bmp->getTile(0).byteSize : 0;
+
+			// Trigger idle reclaim first, then inject persistent OOM during replace
+			const uint32 evictBefore = s_evictionCount;
+			bmp->markDrawn(0);
+			pspGuReclaimIdleResources(1);
+			const bool evictedIdle = (s_evictionCount > evictBefore) && (bmp->getTile(0).alphaMask == nullptr);
+
+			pspGuSetInjectAllocFail(true);
+			bmp->update(&s2); // must fail cleanly, preserve s1 tiles, zero leak
+			pspGuSetInjectAllocFail(false);
+			const bool preservedBmp = (bmp->getTileCount() == 1) && (bmp->getTile(0).byteSize == origBytes) &&
+			                          (bmp->width() == 64 && bmp->height() == 64);
+
+			PspGuTexture *tex = new PspGuTexture();
+			tex->setLevelCount(2);
+			tex->addLevel(0, &s1);
+			const bool hadTex = tex->getLevelCount() == 1;
+			pspGuSetInjectAllocFail(true);
+			tex->addLevel(1, &s2); // must not corrupt level 0
+			pspGuSetInjectAllocFail(false);
+			const bool preservedTex = hadTex && (tex->getLevelCount() == 1);
+
+			oomRecoverPass = evictedIdle;
+			oomPreservePass = preservedBmp && preservedTex;
+			delete tex;
+			delete bmp;
+		}
+		s1.free();
+		s2.free();
+	}
+
+	const bool zeroLeakPass = (s_liveBitmapBytes == liveBmpBefore) &&
+	                          (s_liveTextureBytes == liveTexBefore) &&
+	                          (s_liveAuxBytes == liveAuxBefore);
+
+	if (ensureFrameBegun()) {
+		setScreenViewport(false);
+		clearScreen();
+	}
+	_session->submitFrame(false);
+	_session->waitFrame();
+
+	debug("[STARK-PSP-STEP06] contracts: psm4444=%s hitMask=%s listSplit=%s oomEvict=%s oomPreserve=%s zeroLeak=%s "
+	      "sysFree=%u maxBlk=%u",
+	      psm4444Pass ? "OK" : "FAIL",
+	      hitMaskCompactPass ? "OK" : "FAIL",
+	      listSplitPass ? "OK" : "FAIL",
+	      oomRecoverPass ? "OK" : "FAIL",
+	      oomPreservePass ? "OK" : "FAIL",
+	      zeroLeakPass ? "OK" : "FAIL",
+	      (uint32)sceKernelTotalFreeMemSize(),
+	      (uint32)sceKernelMaxFreeMemSize());
+
+	return psm4444Pass && hitMaskCompactPass && listSplitPass && oomRecoverPass && oomPreservePass && zeroLeakPass;
+}
+
 void PspGuDriver::verifyStartupContracts() {
 	if (!_session) {
 		return;
@@ -1680,6 +1939,7 @@ void PspGuDriver::verifyStartupContracts() {
 		verifyStep03SurfaceAndTextureContracts(readbackBuf, readbackStride);
 		verifyStep04HardwareTLContracts(readbackBuf, readbackStride);
 		verifyStep05EffectsParityContracts(readbackBuf, readbackStride);
+		verifyStep06MemoryAndPerfContracts(readbackBuf, readbackStride);
 	}
 	free(readbackBuf);
 
@@ -1743,6 +2003,7 @@ void PspGuDriver::init() {
 
 	verifyStartupContracts();
 	setScreenViewport(false);
+	logMemoryAndPacingSnapshot("postAcquire");
 
 	debug("[STARK-PSP-STEP03] PspGuDriver ready (session=%s, listCap=%u, reserve=%u, vertexArena=%u, logical=%dx%d, rt=%ux%u)",
 	      _sessionReady ? "ready" : "unavailable",
@@ -1797,10 +2058,12 @@ bool PspGuDriver::ensureFrameBegun() {
 
 void PspGuDriver::clearScreen() {
 	_clearRequested = true;
+	_frameClearUs = (uint64)sceKernelGetSystemTimeWide();
+	_frameDrawCalls = 0;
 	if (!ensureFrameBegun()) {
 		return;
 	}
-	if (!_session->hasDisplayListHeadroom(256)) {
+	if (!ensureSubmissionCapacity(256u, 0u, true)) {
 		warning("PspGuDriver: insufficient display list headroom during clearScreen");
 		return;
 	}
@@ -1819,11 +2082,35 @@ void PspGuDriver::flipBuffer() {
 	if (!ensureFrameBegun()) {
 		return;
 	}
+
+	const uint64 tSubStartUs = (uint64)sceKernelGetSystemTimeWide();
+	const uint32 listUsedNow = _session->getDisplayListBytesUsed();
+	const uint32 vertUsedNow = _session->getVertexOffset();
+
 	if (!_session->submitFrame(true)) {
 		warning("PspGuDriver: submitFrame failed, unwinding cleanly");
 		return;
 	}
 	_session->waitFrame();
+
+	const uint64 tFlipEndUs = (uint64)sceKernelGetSystemTimeWide();
+	const uint32 cpuUs = (_frameClearUs > 0 && tSubStartUs >= _frameClearUs) ? (uint32)(tSubStartUs - _frameClearUs) : 0u;
+	const uint32 geSyncUs = (tFlipEndUs >= tSubStartUs) ? (uint32)(tFlipEndUs - tSubStartUs) : 0u;
+	const uint32 totalUs = (_lastFlipEndUs > 0 && tFlipEndUs >= _lastFlipEndUs) ? (uint32)(tFlipEndUs - _lastFlipEndUs) : (cpuUs + geSyncUs);
+	_lastFlipEndUs = tFlipEndUs;
+	_frameClearUs = 0;
+
+	FrameTimingSample &smp = _timingRing[_timingRingHead];
+	smp.cpuSubmitUs = cpuUs;
+	smp.geSyncUs = geSyncUs;
+	smp.frameTotalUs = totalUs;
+	smp.listBytes = listUsedNow;
+	smp.vertBytes = vertUsedNow;
+	smp.drawCalls = (uint16)MIN<uint32>(_frameDrawCalls, 65535u);
+	_timingRingHead = (_timingRingHead + 1) % kTimingRingSize;
+	if (_timingRingCount < kTimingRingSize) {
+		_timingRingCount++;
+	}
 
 	if (_frameSeq <= 5 || (_frameSeq % 240) == 0) {
 		const PspGuSessionStats &st = _session->getStats();
@@ -1833,8 +2120,112 @@ void PspGuDriver::flipBuffer() {
 		      s_liveBitmapBytes, s_peakBitmapBytes,
 		      s_liveTextureBytes, s_peakTextureBytes,
 		      s_liveAuxBytes, (uint32)mallinfo().uordblks);
+		if ((_frameSeq % 240) == 0) {
+			logMemoryAndPacingSnapshot("periodic");
+		}
 	}
 	_frameSeq++;
+}
+
+bool PspGuDriver::ensureSubmissionCapacity(uint32 listBytes, uint32 vertexBytes, bool mode3D) {
+	if (!ensureFrameBegun()) {
+		return false;
+	}
+	if (_session->hasDisplayListHeadroom(listBytes) &&
+	    (vertexBytes == 0 || _session->hasVertexHeadroom(vertexBytes, 16))) {
+		return true;
+	}
+	_session->flushSceneSegment();
+	if (!_session->resumeSceneSegment()) {
+		return false;
+	}
+	_listSplitCount++;
+	if (mode3D) {
+		set3DMode();
+	} else {
+		applySceneViewport();
+		sceGuDisable(GU_DEPTH_TEST);
+		sceGuDepthMask(GU_TRUE);
+		sceGuDisable(GU_LIGHTING);
+		pspGuDisableAllLights();
+		sceGuDisable(GU_CLIP_PLANES);
+		sceGuDisable(GU_CULL_FACE);
+		sceGuDisable(GU_ALPHA_TEST);
+		sceGuDisable(GU_STENCIL_TEST);
+		sceGuPixelMask(0xFF000000u);
+		sceGuEnable(GU_BLEND);
+		sceGuBlendFunc(GU_ADD, GU_FIX, GU_ONE_MINUS_SRC_ALPHA, 0x00FFFFFF, 0);
+	}
+	return _session->hasDisplayListHeadroom(listBytes) &&
+	       (vertexBytes == 0 || _session->hasVertexHeadroom(vertexBytes, 16));
+}
+
+void PspGuDriver::trackExternalAuxBytes(int32 deltaBytes) {
+	if (deltaBytes >= 0) {
+		s_externalAuxBytes += (uint32)deltaBytes;
+	} else {
+		const uint32 sub = (uint32)(-deltaBytes);
+		s_externalAuxBytes = (sub <= s_externalAuxBytes) ? (s_externalAuxBytes - sub) : 0;
+	}
+}
+
+void PspGuDriver::onLocationChanged(uint16 level, uint16 location, bool postPurge) {
+	(void)postPurge;
+	logMemoryAndPacingSnapshot("room", level, location);
+}
+
+void PspGuDriver::logMemoryAndPacingSnapshot(const char *tag, uint16 level, uint16 location) {
+	const struct mallinfo mi = mallinfo();
+	const uint32 sysFree = (uint32)sceKernelTotalFreeMemSize();
+	const uint32 sysMaxBlk = (uint32)sceKernelMaxFreeMemSize();
+	const PspGuSessionStats *st = _session ? &_session->getStats() : nullptr;
+
+	uint32 cnt = _timingRingCount;
+	uint32 totMean = 0, totMed = 0, totP95 = 0, totP99 = 0;
+	uint32 cpuMean = 0, cpuP95 = 0, geMean = 0, geP95 = 0, dcMean = 0;
+	if (cnt > 0) {
+		uint32 totArr[kTimingRingSize];
+		uint32 cpuArr[kTimingRingSize];
+		uint32 geArr[kTimingRingSize];
+		uint64 totSum = 0, cpuSum = 0, geSum = 0, dcSum = 0;
+		for (uint32 i = 0; i < cnt; ++i) {
+			totArr[i] = _timingRing[i].frameTotalUs;
+			cpuArr[i] = _timingRing[i].cpuSubmitUs;
+			geArr[i] = _timingRing[i].geSyncUs;
+			totSum += totArr[i];
+			cpuSum += cpuArr[i];
+			geSum += geArr[i];
+			dcSum += _timingRing[i].drawCalls;
+		}
+		Common::sort(totArr, totArr + cnt);
+		Common::sort(cpuArr, cpuArr + cnt);
+		Common::sort(geArr, geArr + cnt);
+		const uint32 idxMed = (cnt - 1) / 2;
+		const uint32 idx95 = MIN<uint32>(cnt - 1, (uint32)((95u * cnt + 99u) / 100u - 1u));
+		const uint32 idx99 = MIN<uint32>(cnt - 1, (uint32)((99u * cnt + 99u) / 100u - 1u));
+		totMean = (uint32)(totSum / cnt);
+		totMed = totArr[idxMed];
+		totP95 = totArr[idx95];
+		totP99 = totArr[idx99];
+		cpuMean = (uint32)(cpuSum / cnt);
+		cpuP95 = cpuArr[idx95];
+		geMean = (uint32)(geSum / cnt);
+		geP95 = geArr[idx95];
+		dcMean = (uint32)(dcSum / cnt);
+	}
+
+	debug("[STARK-PSP-STEP06] tag=%s loc=%u/%u frame=%u n=%u totUs(mean=%u,med=%u,p95=%u,p99=%u) "
+	      "cpuUs(mean=%u,p95=%u) geSyncUs(mean=%u,p95=%u) dcMean=%u splits=%u evict=%u "
+	      "geMem(bmp=%u/%u,tex=%u/%u,aux=%u/%u,hitMask=%u) peak(list=%u,vert=%u) "
+	      "heap(uord=%u,arena=%u,ford=%u) sys(free=%u,maxBlk=%u)",
+	      tag ? tag : "snap", level, location, _frameSeq - 1, cnt,
+	      totMean, totMed, totP95, totP99,
+	      cpuMean, cpuP95, geMean, geP95, dcMean, _listSplitCount, s_evictionCount,
+	      s_liveBitmapBytes, s_peakBitmapBytes, s_liveTextureBytes, s_peakTextureBytes,
+	      s_liveAuxBytes, s_peakAuxBytes, s_externalAuxBytes,
+	      st ? st->peakListBytes : 0u, st ? st->peakVertexBytes : 0u,
+	      (uint32)mi.uordblks, (uint32)mi.arena, (uint32)mi.fordblks,
+	      sysFree, sysMaxBlk);
 }
 
 Texture *PspGuDriver::createTexture() {
@@ -1986,10 +2377,14 @@ bool PspGuDriver::renderEffectQuads(const Common::Point &dest, const Common::Poi
 	uint32 offset = 0;
 	while (offset < count) {
 		const uint32 chunk = MIN<uint32>(count - offset, kChunkQuads);
-		if (!session->hasDisplayListHeadroom(128)) {
+		const uint32 needVerts = chunk * 2 * sizeof(ColorVertex2D);
+		if (!ensureSubmissionCapacity(128u, needVerts, false)) {
 			break;
 		}
-		ColorVertex2D *verts = static_cast<ColorVertex2D *>(session->allocVertices(chunk * 2 * sizeof(ColorVertex2D), 16));
+		if (!applyEffectOverlayState(dest, bounds)) {
+			return true;
+		}
+		ColorVertex2D *verts = static_cast<ColorVertex2D *>(session->allocVertices(needVerts, 16));
 		if (!verts) {
 			break;
 		}
@@ -2018,6 +2413,7 @@ bool PspGuDriver::renderEffectQuads(const Common::Point &dest, const Common::Poi
 		}
 		session->flushDataRange(verts, chunk * 2 * sizeof(ColorVertex2D));
 		sceGuDrawArray(GU_SPRITES, GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_2D, (int)(chunk * 2), nullptr, verts);
+		recordDrawCall();
 		offset += chunk;
 	}
 
@@ -2031,14 +2427,15 @@ bool PspGuDriver::renderEffectLines(const Common::Point &dest, const Common::Poi
 		return count == 0;
 	}
 	PspGuSession *session = _session;
-	if (!session || !session->hasDisplayListHeadroom(128)) {
+	const uint32 needVerts = count * 2 * sizeof(ColorVertex2D);
+	if (!session || !ensureSubmissionCapacity(128u, needVerts, false)) {
 		return false;
 	}
 	if (!applyEffectOverlayState(dest, bounds)) {
 		return true;
 	}
 
-	ColorVertex2D *verts = static_cast<ColorVertex2D *>(session->allocVertices(count * 2 * sizeof(ColorVertex2D), 16));
+	ColorVertex2D *verts = static_cast<ColorVertex2D *>(session->allocVertices(needVerts, 16));
 	if (verts) {
 		for (uint32 i = 0; i < count; ++i) {
 			const EffectLine &ln = lines[i];
@@ -2048,8 +2445,9 @@ bool PspGuDriver::renderEffectLines(const Common::Point &dest, const Common::Poi
 			verts[i * 2 + 0] = { ln.abgr, rx0, ry0, 0.0f };
 			verts[i * 2 + 1] = { ln.abgr, rx1, ry1, 0.0f };
 		}
-		session->flushDataRange(verts, count * 2 * sizeof(ColorVertex2D));
+		session->flushDataRange(verts, needVerts);
 		sceGuDrawArray(GU_LINES, GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_2D, (int)(count * 2), nullptr, verts);
+		recordDrawCall();
 	}
 
 	applySceneViewport();

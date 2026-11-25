@@ -198,14 +198,17 @@ void PspGuSurfaceRenderer::render(const Bitmap *bitmap, const Common::Point &des
 			continue;
 		}
 
-		if (!session->hasDisplayListHeadroom(hasAlphaFade ? 512 : 256)) {
-			warning("PspGuSurfaceRenderer: display list headroom exhausted");
+		if (!_gfx->ensureSubmissionCapacity(hasAlphaFade ? 512u : 256u, hasAlphaFade ? (4u * sizeof(SpriteVertex2D)) : (2u * sizeof(SpriteVertex2D)), false)) {
 			break;
 		}
+		prepare2DState();
+		sceGuEnable(GU_TEXTURE_2D);
+		sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGBA);
+		sceGuTexFilter(filter, filter);
+		sceGuTexWrap(GU_CLAMP, GU_CLAMP);
 
 		SpriteVertex2D *verts = static_cast<SpriteVertex2D *>(session->allocVertices(2 * sizeof(SpriteVertex2D), 16));
 		if (!verts) {
-			warning("PspGuSurfaceRenderer: vertex arena exhausted");
 			break;
 		}
 
@@ -217,6 +220,7 @@ void PspGuSurfaceRenderer::render(const Bitmap *bitmap, const Common::Point &des
 		sceGuTexImage(0, tile.texW, tile.texH, tile.stride, tile.pixels);
 		sceGuTexFlush();
 		sceGuDrawArray(GU_SPRITES, GU_TEXTURE_32BITF | GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_2D, 2, nullptr, verts);
+		_gfx->recordDrawCall();
 
 		if (hasAlphaFade && tile.alphaMask) {
 			SpriteVertex2D *fVerts = static_cast<SpriteVertex2D *>(session->allocVertices(2 * sizeof(SpriteVertex2D), 16));
@@ -235,6 +239,7 @@ void PspGuSurfaceRenderer::render(const Bitmap *bitmap, const Common::Point &des
 				sceGuPixelMask(0xFF000000u);
 				sceGuBlendFunc(_fadeLevel >= 0.0f ? GU_ADD : GU_REVERSE_SUBTRACT, GU_SRC_ALPHA, GU_FIX, 0, 0x00FFFFFF);
 				sceGuDrawArray(GU_SPRITES, GU_TEXTURE_32BITF | GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_2D, 2, nullptr, fVerts);
+				_gfx->recordDrawCall();
 
 				sceGuPixelMask(0xFF000000u);
 				sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGBA);
@@ -250,11 +255,11 @@ void PspGuSurfaceRenderer::fill(const Color &color, const Common::Point &dest, u
 	if (!_gfx || dstW == 0 || dstH == 0) {
 		return;
 	}
-	if (!_gfx->ensureFrameBegun()) {
+	if (!_gfx->ensureSubmissionCapacity(256, 2 * sizeof(SolidVertex2D), false)) {
 		return;
 	}
 	PspGuSession *session = _gfx->getSession();
-	if (!session || !session->hasDisplayListHeadroom(256)) {
+	if (!session) {
 		return;
 	}
 
@@ -284,6 +289,7 @@ void PspGuSurfaceRenderer::fill(const Color &color, const Common::Point &dest, u
 	prepare2DState();
 	sceGuDisable(GU_TEXTURE_2D);
 	sceGuDrawArray(GU_SPRITES, GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_2D, 2, nullptr, verts);
+	_gfx->recordDrawCall();
 }
 
 } // End of namespace Gfx

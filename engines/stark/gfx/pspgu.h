@@ -67,6 +67,10 @@ uint32 pspGuGetPeakBitmapBytes();
 uint32 pspGuGetLiveTextureBytes();
 uint32 pspGuGetPeakTextureBytes();
 uint32 pspGuGetLiveAuxBytes();
+uint32 pspGuGetPeakAuxBytes();
+void *pspGuAllocAlignedWithRetry(uint32 alignment, uint32 size);
+void pspGuSetInjectAllocFail(bool enable);
+uint32 pspGuReclaimIdleResources(uint32 minBytes = 0);
 
 /**
  * Native PSP sceGu / sceGum graphics driver for STARK.
@@ -102,6 +106,9 @@ public:
 	bool renderEffectLines(const Common::Point &dest, const Common::Point &bounds,
 	                       const EffectLine *lines, uint32 count) override;
 
+	void trackExternalAuxBytes(int32 deltaBytes) override;
+	void onLocationChanged(uint16 level, uint16 location, bool postPurge) override;
+
 	PspGuSession *getSession() const { return _session; }
 	bool isSessionReady() const { return _sessionReady; }
 	const Common::Rect &getViewport() const { return _viewport; }
@@ -110,6 +117,9 @@ public:
 	uint32 getFrameSeq() const { return _frameSeq; }
 
 	bool ensureFrameBegun();
+	bool ensureSubmissionCapacity(uint32 listBytes, uint32 vertexBytes, bool mode3D);
+	void recordDrawCall() { _frameDrawCalls++; }
+	void logMemoryAndPacingSnapshot(const char *tag, uint16 level = 0, uint16 location = 0);
 	void applySceneViewport() const;
 	void applyDepthConfig(bool reverseDepth) const;
 	void mapLogical2DToRt(float lx, float ly, float &outX, float &outY) const;
@@ -126,7 +136,18 @@ private:
 	bool verifyStep03SurfaceAndTextureContracts(uint32 *readbackBuf, uint32 readbackStride);
 	bool verifyStep04HardwareTLContracts(uint32 *readbackBuf, uint32 readbackStride);
 	bool verifyStep05EffectsParityContracts(uint32 *readbackBuf, uint32 readbackStride);
+	bool verifyStep06MemoryAndPerfContracts(uint32 *readbackBuf, uint32 readbackStride);
 	bool applyEffectOverlayState(const Common::Point &dest, const Common::Point &bounds) const;
+
+	struct FrameTimingSample {
+		uint32 cpuSubmitUs;
+		uint32 geSyncUs;
+		uint32 frameTotalUs;
+		uint32 listBytes;
+		uint32 vertBytes;
+		uint16 drawCalls;
+	};
+	static const uint32 kTimingRingSize = 256;
 
 	PspGuSession *_session;
 	Common::Rect _viewport;
@@ -137,6 +158,15 @@ private:
 	bool _reverseDepth;
 	uint32 _frameSeq;
 	uint32 _unimplementedMask;
+	FrameTimingSample _timingRing[kTimingRingSize];
+	uint32 _timingRingHead;
+	uint32 _timingRingCount;
+	uint64 _frameClearUs;
+	uint64 _lastFlipEndUs;
+	uint32 _frameDrawCalls;
+	uint32 _listSplitCount;
+	uint32 _oomRetryCount;
+	uint32 _oomFailCount;
 };
 
 } // End of namespace Gfx

@@ -38,6 +38,7 @@
 #include "engines/stark/services/global.h"
 #include "engines/stark/services/stateprovider.h"
 #include "engines/stark/services/userinterface.h"
+#include "engines/stark/gfx/driver.h"
 
 namespace Stark {
 
@@ -254,6 +255,10 @@ void ResourceProvider::performLocationChange() {
 
 	current->getLocation()->resetAnimationBlending();
 	purgeOldLocations();
+
+	if (StarkGfx) {
+		StarkGfx->onLocationChanged(current->getLevel()->getIndex(), current->getLocation()->getIndex(), true);
+	}
 
 	_locationChangeRequest = false;
 }

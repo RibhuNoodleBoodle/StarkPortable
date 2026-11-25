@@ -169,6 +169,10 @@ public:
 		(void)dest; (void)bounds; (void)lines; (void)count;
 		return false;
 	}
+	virtual void trackExternalAuxBytes(int32 deltaBytes) { (void)deltaBytes; }
+	virtual void onLocationChanged(uint16 level, uint16 location, bool postPurge) {
+		(void)level; (void)location; (void)postPurge;
+	}
 
 	virtual bool supportsModdedAssets() const { return true; }
 

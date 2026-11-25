@@ -64,9 +64,12 @@ public:
 	const Tile &getTile(uint32 index) const { return _tiles[index]; }
 
 	bool ensureAlphaMasks() const;
+	uint32 releaseAlphaMasks();
 	void markDrawn(uint32 frameSeq) const { _lastDrawnFrameSeq = frameSeq; }
+	uint32 getLastDrawnFrameSeq() const { return _lastDrawnFrameSeq; }
 
 	static const uint32 *getAlphaFadeClut();
+	static uint32 reclaimIdleAlphaMasks(uint32 currentFrameSeq, uint32 minBytes);
 
 private:
 	void releaseTiles();

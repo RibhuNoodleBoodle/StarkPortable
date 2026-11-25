@@ -24,6 +24,7 @@
 
 #include "engines/stark/visual/visual.h"
 
+#include "common/array.h"
 #include "common/rect.h"
 #include "common/stream.h"
 
@@ -92,6 +93,7 @@ public:
 
 private:
 	Graphics::Surface *multiplyColorWithAlpha(const Graphics::Surface *source);
+	void compactSurfaceIfSafe();
 
 	Gfx::Driver *_gfx;
 	Gfx::SurfaceRenderer *_surfaceRenderer;
@@ -100,6 +102,10 @@ private:
 	Common::Point _hotspot;
 	uint _originalWidth;
 	uint _originalHeight;
+	uint16 _surfaceW;
+	uint16 _surfaceH;
+	bool _hasSolidMask;
+	Common::Array<uint8> _solidMask;
 };
 
 } // End of namespace Stark
