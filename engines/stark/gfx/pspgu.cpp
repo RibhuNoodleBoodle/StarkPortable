@@ -29,9 +29,11 @@
 #include <string.h>
 #include <pspgu.h>
 #include <pspgum.h>
+#include <psputils.h>
 
 #include "backends/platform/psp/psp_gu_session.h"
 
+#include "engines/stark/formats/biffmesh.h"
 #include "engines/stark/scene.h"
 #include "engines/stark/gfx/color.h"
 #include "engines/stark/gfx/pspguactor.h"
@@ -94,6 +96,237 @@ uint32 readPixelAbgrFromSurface(const Graphics::Surface *src, const byte *palett
 }
 
 } // namespace
+
+void pspGuWritebackCache64(const void *ptr, uint32 bytes) {
+	if (!ptr || bytes == 0) {
+		return;
+	}
+	const uintptr start = reinterpret_cast<uintptr>(ptr) & ~static_cast<uintptr>(63);
+	const uintptr end = (reinterpret_cast<uintptr>(ptr) + bytes + 63) & ~static_cast<uintptr>(63);
+	sceKernelDcacheWritebackRange(reinterpret_cast<const void *>(start), static_cast<unsigned int>(end - start));
+}
+
+void pspGuToSceMatrix(const Math::Matrix4 &mat, ScePspFMatrix4 &out) {
+	// Math::Matrix4 is row-major (column vectors); ScePspFMatrix4 stores 4 columns.
+	const float *d = mat.getData();
+	out.x.x = d[0]; out.x.y = d[4]; out.x.z = d[8];  out.x.w = d[12];
+	out.y.x = d[1]; out.y.y = d[5]; out.y.z = d[9];  out.y.w = d[13];
+	out.z.x = d[2]; out.z.y = d[6]; out.z.z = d[10]; out.z.w = d[14];
+	out.w.x = d[3]; out.w.y = d[7]; out.w.z = d[11]; out.w.w = d[15];
+}
+
+void pspGuLoadMatrix4(int matrixMode, const Math::Matrix4 &mat) {
+	alignas(16) ScePspFMatrix4 sceMat;
+	pspGuToSceMatrix(mat, sceMat);
+	sceGumMatrixMode(matrixMode);
+	sceGumLoadMatrix(&sceMat);
+}
+
+uint32 pspGuPackAbgrFloats(float r, float g, float b, float a) {
+	const uint32 rb = (uint32)(CLIP(r, 0.0f, 1.0f) * 255.0f + 0.5f);
+	const uint32 gb = (uint32)(CLIP(g, 0.0f, 1.0f) * 255.0f + 0.5f);
+	const uint32 bb = (uint32)(CLIP(b, 0.0f, 1.0f) * 255.0f + 0.5f);
+	const uint32 ab = (uint32)(CLIP(a, 0.0f, 1.0f) * 255.0f + 0.5f);
+	return (ab << 24) | (bb << 16) | (gb << 8) | rb;
+}
+
+bool pspGuCanUseHardwareLights(const LightEntryArray &lights) {
+	if (lights.empty()) {
+		return false;
+	}
+	uint32 nonAmbientCount = 0;
+	for (uint32 li = 0; li < lights.size(); ++li) {
+		const LightEntry *light = lights[li];
+		if (!light) {
+			return false;
+		}
+		if (light->color.x() < -0.0001f || light->color.y() < -0.0001f || light->color.z() < -0.0001f) {
+			return false;
+		}
+		if (li == 0) {
+			if (light->type != LightEntry::kAmbient) {
+				return false;
+			}
+		} else {
+			if (light->type == LightEntry::kAmbient) {
+				return false;
+			}
+			++nonAmbientCount;
+			if (nonAmbientCount > 4) {
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
+void pspGuDisableAllLights() {
+	sceGuDisable(GU_LIGHT0);
+	sceGuDisable(GU_LIGHT1);
+	sceGuDisable(GU_LIGHT2);
+	sceGuDisable(GU_LIGHT3);
+}
+
+bool pspGuSetupLightingOrCpuMode(const LightEntryArray &lights, const Math::Vector3d &matRgb) {
+	if (!pspGuCanUseHardwareLights(lights)) {
+		sceGuDisable(GU_LIGHTING);
+		pspGuDisableAllLights();
+		return false;
+	}
+
+	pspGuDisableAllLights();
+	sceGuEnable(GU_LIGHTING);
+	sceGuShadeModel(GU_SMOOTH);
+	sceGuSpecular(0.0f);
+	sceGuColorMaterial(0);
+
+	const uint32 matAbgr = pspGuPackAbgrFloats(matRgb.x(), matRgb.y(), matRgb.z(), 1.0f);
+	sceGuModelColor(0x00000000u, matAbgr, matAbgr, 0x00000000u);
+
+	const LightEntry *amb = lights[0];
+	sceGuAmbient(pspGuPackAbgrFloats(amb->color.x(), amb->color.y(), amb->color.z(), 1.0f));
+
+	for (uint32 li = 1; li < lights.size(); ++li) {
+		const int slot = (int)(li - 1);
+		const LightEntry *light = lights[li];
+		const uint32 lCol = pspGuPackAbgrFloats(light->color.x(), light->color.y(), light->color.z(), 1.0f);
+		sceGuLightColor(slot, GU_AMBIENT, 0xFF000000u);
+		sceGuLightColor(slot, GU_DIFFUSE, lCol);
+		sceGuLightColor(slot, GU_SPECULAR, 0xFF000000u);
+
+		switch (light->type) {
+		case LightEntry::kDirectional: {
+			Math::Vector3d toLight = -light->direction;
+			if (toLight.getSquareMagnitude() > 1e-8f) {
+				toLight.normalize();
+			}
+			const ScePspFVector3 lPos = { toLight.x(), toLight.y(), toLight.z() };
+			sceGuLight(slot, GU_DIRECTIONAL, GU_DIFFUSE, &lPos);
+			sceGuLightAtt(slot, 1.0f, 0.0f, 0.0f);
+			sceGuEnable(GU_LIGHT0 + slot);
+			break;
+		}
+		case LightEntry::kPoint: {
+			const ScePspFVector3 lPos = { light->position.x(), light->position.y(), light->position.z() };
+			sceGuLight(slot, GU_POINTLIGHT, GU_DIFFUSE, &lPos);
+			const float halfDist = MAX(1.0f, 0.5f * (MAX(0.0f, light->falloffNear) + MAX(1.0f, light->falloffFar)));
+			sceGuLightAtt(slot, 1.0f, 0.0f, 1.0f / (halfDist * halfDist));
+			sceGuEnable(GU_LIGHT0 + slot);
+			break;
+		}
+		case LightEntry::kSpot: {
+			const ScePspFVector3 lPos = { light->position.x(), light->position.y(), light->position.z() };
+			sceGuLight(slot, GU_SPOTLIGHT, GU_DIFFUSE, &lPos);
+			const float halfDist = MAX(1.0f, 0.5f * (MAX(0.0f, light->falloffNear) + MAX(1.0f, light->falloffFar)));
+			sceGuLightAtt(slot, 1.0f, 0.0f, 1.0f / (halfDist * halfDist));
+
+			Math::Vector3d spotDir = -light->direction;
+			if (spotDir.getSquareMagnitude() > 1e-8f) {
+				spotDir.normalize();
+			}
+			const ScePspFVector3 lDir = { spotDir.x(), spotDir.y(), spotDir.z() };
+			const float cosOuter = CLIP(light->outerConeAngle.getCosine(), -1.0f, 1.0f);
+			const float cosInner = CLIP(light->innerConeAngle.getCosine(), cosOuter, 1.0f);
+			const float cosMid = CLIP(0.5f * (cosInner + cosOuter), 0.05f, 0.9995f);
+			const float exponent = CLIP(logf(0.5f) / logf(cosMid), 1.0f, 64.0f);
+			// sceGuLightSpot writes raw float cutoff directly to GE_CMD_LIGHTCUTOFF without cosf().
+			sceGuLightSpot(slot, &lDir, exponent, cosOuter);
+			sceGuEnable(GU_LIGHT0 + slot);
+			break;
+		}
+		default:
+			break;
+		}
+	}
+	return true;
+}
+
+uint32 pspGuEvaluateLightsCpu(const Math::Matrix4 &modelView, const Math::Matrix4 &normalRot,
+                              const Math::Vector3d &modelPos, const Math::Vector3d &modelNormal,
+                              const Math::Vector3d &baseRgb, const LightEntryArray &lights) {
+	if (lights.empty()) {
+		return pspGuPackAbgrFloats(baseRgb.x(), baseRgb.y(), baseRgb.z(), 1.0f);
+	}
+
+	Math::Vector4d eyePos4;
+	eyePos4(0, 0) = modelPos.x();
+	eyePos4(1, 0) = modelPos.y();
+	eyePos4(2, 0) = modelPos.z();
+	eyePos4(3, 0) = 1.0f;
+	eyePos4 = modelView * eyePos4;
+	const Math::Vector3d modelEyePos(eyePos4(0, 0), eyePos4(1, 0), eyePos4(2, 0));
+
+	// normalRot was inverted from modelView; transposing its 3x3 matches inverse-transpose normal transform.
+	Math::Matrix3 normalMat = normalRot.getRotation();
+	normalMat.transpose();
+	Math::Vector3d modelEyeNormal = normalMat * modelNormal;
+	if (modelEyeNormal.getSquareMagnitude() > 1e-8f) {
+		modelEyeNormal.normalize();
+	}
+
+	Math::Vector3d lightColor(0.0f, 0.0f, 0.0f);
+	for (uint32 li = 0; li < lights.size(); ++li) {
+		const LightEntry *light = lights[li];
+		if (!light) {
+			continue;
+		}
+		switch (light->type) {
+		case LightEntry::kAmbient:
+			lightColor += light->color;
+			break;
+		case LightEntry::kPoint: {
+			Math::Vector3d vertexToLight = light->eyePosition.getXYZ() - modelEyePos;
+			const float dist = vertexToLight.length();
+			if (dist > 1e-5f) {
+				vertexToLight /= dist;
+			}
+			const float attn = CLIP((light->falloffFar - dist) / MAX(0.001f, light->falloffFar - light->falloffNear), 0.0f, 1.0f);
+			const float incidence = MAX(0.0f, Math::Vector3d::dotProduct(modelEyeNormal, vertexToLight));
+			lightColor += light->color * (attn * incidence);
+			break;
+		}
+		case LightEntry::kDirectional: {
+			Math::Vector3d toLight = -light->eyeDirection;
+			if (toLight.getSquareMagnitude() > 1e-8f) {
+				toLight.normalize();
+			}
+			const float incidence = MAX(0.0f, Math::Vector3d::dotProduct(modelEyeNormal, toLight));
+			lightColor += light->color * incidence;
+			break;
+		}
+		case LightEntry::kSpot: {
+			Math::Vector3d vertexToLight = light->eyePosition.getXYZ() - modelEyePos;
+			const float dist = vertexToLight.length();
+			const float attn = CLIP((light->falloffFar - dist) / MAX(0.001f, light->falloffFar - light->falloffNear), 0.0f, 1.0f);
+			if (dist > 1e-5f) {
+				vertexToLight /= dist;
+			}
+			const float incidence = MAX(0.0f, Math::Vector3d::dotProduct(modelEyeNormal, vertexToLight));
+			Math::Vector3d eyeSpotToLight = -light->eyeDirection;
+			if (eyeSpotToLight.getSquareMagnitude() > 1e-8f) {
+				eyeSpotToLight.normalize();
+			}
+			const float cosAngle = MAX(0.0f, Math::Vector3d::dotProduct(vertexToLight, eyeSpotToLight));
+			const float cosOuter = light->outerConeAngle.getCosine();
+			const float cosInner = light->innerConeAngle.getCosine();
+			const float cone = (cosInner > cosOuter)
+			                   ? CLIP((cosAngle - cosOuter) / MAX(0.001f, cosInner - cosOuter), 0.0f, 1.0f)
+			                   : (cosAngle >= cosOuter ? 1.0f : 0.0f);
+			lightColor += light->color * (attn * incidence * cone);
+			break;
+		}
+		default:
+			break;
+		}
+	}
+
+	lightColor.x() = CLIP(lightColor.x(), 0.0f, 1.0f);
+	lightColor.y() = CLIP(lightColor.y(), 0.0f, 1.0f);
+	lightColor.z() = CLIP(lightColor.z(), 0.0f, 1.0f);
+	return pspGuPackAbgrFloats(baseRgb.x() * lightColor.x(),
+	                           baseRgb.y() * lightColor.y(),
+	                           baseRgb.z() * lightColor.z(), 1.0f);
+}
 
 uint32 pspGuNextPow2Clamped(uint32 value, uint32 minPow2, uint32 maxPow2) {
 	uint32 p = minPow2;
@@ -368,7 +601,7 @@ void PspGuDriver::applySceneViewport() const {
 	const int32 vpCenterY = offY + (_rtViewport.top + _rtViewport.bottom) / 2;
 
 	sceGuOffset(offX, offY);
-	sceGuViewport(vpCenterX, vpCenterY, rw, -rh);
+	sceGuViewport(vpCenterX, vpCenterY, rw, rh);
 	sceGuScissor(_rtViewport.left, _rtViewport.top, rw, rh);
 	sceGuEnable(GU_SCISSOR_TEST);
 }
@@ -607,6 +840,441 @@ bool PspGuDriver::verifyStep03SurfaceAndTextureContracts(uint32 *readbackBuf, ui
 	return tileSeamPass && premulFadePass && texMipPass && zeroLeakPass;
 }
 
+bool PspGuDriver::verifyStep04HardwareTLContracts(uint32 *readbackBuf, uint32 readbackStride) {
+	const uint32 liveAuxBefore = s_liveAuxBytes;
+	bool matParityPass = false;
+	bool clipPlanePass = false;
+	bool hwLightsPass = false;
+	bool cpuOverflowPass = false;
+	bool skin2BonePass = false;
+	bool propSplitPass = false;
+
+	if (!ensureFrameBegun()) {
+		return false;
+	}
+
+	// 1. Asymmetric matrix + GU_CLIP_PLANES near-plane clipping + reflected depth ordering
+	{
+		set3DMode();
+		sceGuDisable(GU_TEXTURE_2D);
+		sceGuClearColor(0xFF000000u);
+		sceGuClearDepth(0);
+		sceGuClear(GU_COLOR_BUFFER_BIT | GU_DEPTH_BUFFER_BIT);
+
+		// Perspective projection with asymmetric off-center frustum matching Stark camera (Z-up, +Y look)
+		Scene clipScene(this);
+		clipScene.initCamera(Math::Vector3d(0.0f, -100.0f, 0.0f),
+		                     Math::Vector3d(0.0f, 1.0f, 0.0f),
+		                     60.0f, Common::Rect(640, 365), 10.0f, 1000.0f);
+		clipScene.scrollCamera(Common::Rect(20, 10, 620, 355));
+		const Math::Matrix4 proj = clipScene.getProjectionMatrix();
+		const Math::Matrix4 view = clipScene.getViewMatrix();
+
+		// Reflected scale(1, 1, -1) like getModelMatrix()
+		Math::Matrix4 model;
+		model.setToIdentity();
+		model(2, 2) = -1.0f;
+
+		pspGuLoadMatrix4(GU_PROJECTION, proj);
+		pspGuLoadMatrix4(GU_VIEW, view);
+		pspGuLoadMatrix4(GU_MODEL, model);
+
+		// Camera is at y=-100 looking +Y (near plane y=-90, origin y=0 is 100 units ahead); model flips Z -> -Z:
+		// Far green triangle at y=20 (dist=120), near-clipped red triangle straddles near plane (one vertex at y=-98 -> dist=2 < 10).
+		struct Vert3DCol {
+			uint32 color;
+			float x, y, z;
+		};
+		Vert3DCol *clipTris = static_cast<Vert3DCol *>(_session->allocVertices(6 * sizeof(Vert3DCol), 16));
+		if (clipTris) {
+			clipTris[0] = { 0xFF00FF00u, -30.0f,  20.0f,  30.0f };
+			clipTris[1] = { 0xFF00FF00u,  30.0f,  20.0f,  30.0f };
+			clipTris[2] = { 0xFF00FF00u,   0.0f,  20.0f, -30.0f };
+			clipTris[3] = { 0xFF0000FFu, -40.0f,   0.0f,  25.0f };
+			clipTris[4] = { 0xFF0000FFu,  40.0f,   0.0f,  25.0f };
+			clipTris[5] = { 0xFF0000FFu,   0.0f, -98.0f, -30.0f };
+			_session->flushDataRange(clipTris, 6 * sizeof(Vert3DCol));
+			applyDepthConfig(true);
+			sceGumDrawArray(GU_TRIANGLES, GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_3D, 3, nullptr, clipTris);
+			sceGumDrawArray(GU_TRIANGLES, GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_3D, 3, nullptr, clipTris + 3);
+		}
+
+		_session->flushSceneSegment();
+		const bool readOk = _session->readSceneRectToRam(0, 0, 320, 240, readbackBuf, readbackStride);
+		_session->resumeSceneSegment();
+
+		if (readOk) {
+			// Scene viewport centers vertically inside 320x240; check top corner untouched + red near-clipped triangle occluding far green.
+			const uint32 cornerPx = readbackBuf[10 * readbackStride + 10];
+			bool sawRed = false;
+			for (int32 py = 90; py <= 150 && !sawRed; py += 4) {
+				for (int32 px = 130; px <= 190; px += 4) {
+					const uint32 c = readbackBuf[py * readbackStride + px];
+					if ((c & 0xFFu) > 200 && ((c >> 8) & 0xFFu) < 30 && ((c >> 16) & 0xFFu) < 30) {
+						sawRed = true;
+						break;
+					}
+				}
+			}
+			clipPlanePass = ((cornerPx & 0x00FFFFFFu) == 0u) && sawRed;
+
+			// Also verify matrix conversion directly places translation in column w (out.w.x/y/z)
+			Math::Matrix4 testMat;
+			testMat.setToIdentity();
+			testMat.setPosition(Math::Vector3d(12.5f, -7.25f, 3.75f));
+			ScePspFMatrix4 sceM;
+			pspGuToSceMatrix(testMat, sceM);
+			matParityPass = (fabsf(sceM.w.x - 12.5f) < 1e-4f) &&
+			                (fabsf(sceM.w.y + 7.25f) < 1e-4f) &&
+			                (fabsf(sceM.w.z - 3.75f) < 1e-4f) &&
+			                (fabsf(sceM.w.w - 1.0f) < 1e-4f) &&
+			                sawRed;
+		}
+	}
+
+	// 2. Hardware GE lights: GU_DIRECTIONAL, GU_POINTLIGHT, GU_SPOTLIGHT (axis & cosf cutoff)
+	{
+		set3DMode();
+		sceGuDisable(GU_TEXTURE_2D);
+		sceGuDisable(GU_DEPTH_TEST);
+		sceGuClearColor(0xFF000000u);
+		sceGuClear(GU_COLOR_BUFFER_BIT | GU_DEPTH_BUFFER_BIT);
+
+		Math::Matrix4 idMat;
+		idMat.setToIdentity();
+		// Simple [-1, 1] NDC view without clipping z=0
+		pspGuLoadMatrix4(GU_PROJECTION, idMat);
+		pspGuLoadMatrix4(GU_VIEW, idMat);
+		pspGuLoadMatrix4(GU_MODEL, idMat);
+
+		struct LitQuadVert {
+			float nx, ny, nz;
+			float x, y, z;
+		};
+
+		auto makeLight = [](LightEntry::Type t, const Math::Vector3d &col) -> LightEntry {
+			LightEntry le;
+			le.type = t;
+			le.color = col;
+			le.position = Math::Vector3d(0.0f, 0.0f, 0.0f);
+			le.direction = Math::Vector3d(0.0f, 0.0f, -1.0f);
+			le.innerConeAngle = Math::Angle(15.0f);
+			le.outerConeAngle = Math::Angle(30.0f);
+			le.falloffNear = 0.5f;
+			le.falloffFar = 10.0f;
+			le.worldPosition = Math::Vector4d(0.0f, 0.0f, 0.0f, 1.0f);
+			le.eyePosition = Math::Vector4d(0.0f, 0.0f, 0.0f, 1.0f);
+			le.eyeDirection = Math::Vector3d(0.0f, 0.0f, -1.0f);
+			return le;
+		};
+
+		LightEntry amb = makeLight(LightEntry::kAmbient, Math::Vector3d(0.0f, 0.0f, 0.0f));
+
+		// Test A (left): GU_DIRECTIONAL pointing -Z -> surface normal +Z -> pure green
+		LightEntry dirL = makeLight(LightEntry::kDirectional, Math::Vector3d(0.0f, 1.0f, 0.0f));
+		dirL.direction = Math::Vector3d(0.0f, 0.0f, -1.0f);
+		LightEntryArray dirArr;
+		dirArr.push_back(&amb);
+		dirArr.push_back(&dirL);
+		LitQuadVert *qDir = static_cast<LitQuadVert *>(_session->allocVertices(16 * sizeof(LitQuadVert), 16));
+		if (qDir) {
+			LitQuadVert *qPt = qDir + 4;
+			LitQuadVert *qSpotIn = qDir + 8;
+			LitQuadVert *qSpotOut = qDir + 12;
+
+			qDir[0] = { 0, 0, 1, -0.90f, -0.4f, 0.0f };
+			qDir[1] = { 0, 0, 1, -0.50f, -0.4f, 0.0f };
+			qDir[2] = { 0, 0, 1, -0.90f,  0.4f, 0.0f };
+			qDir[3] = { 0, 0, 1, -0.50f,  0.4f, 0.0f };
+
+			qPt[0] = { 0, 0, 1, -0.40f, -0.4f, 0.0f };
+			qPt[1] = { 0, 0, 1,  0.00f, -0.4f, 0.0f };
+			qPt[2] = { 0, 0, 1, -0.40f,  0.4f, 0.0f };
+			qPt[3] = { 0, 0, 1,  0.00f,  0.4f, 0.0f };
+
+			qSpotIn[0] = { 0, 0, 1, 0.25f, -0.06f, 0.0f };
+			qSpotIn[1] = { 0, 0, 1, 0.35f, -0.06f, 0.0f };
+			qSpotIn[2] = { 0, 0, 1, 0.25f,  0.06f, 0.0f };
+			qSpotIn[3] = { 0, 0, 1, 0.35f,  0.06f, 0.0f };
+
+			qSpotOut[0] = { 0, 0, 1, 0.70f, -0.4f, 0.0f };
+			qSpotOut[1] = { 0, 0, 1, 0.95f, -0.4f, 0.0f };
+			qSpotOut[2] = { 0, 0, 1, 0.70f,  0.4f, 0.0f };
+			qSpotOut[3] = { 0, 0, 1, 0.95f,  0.4f, 0.0f };
+
+			_session->flushDataRange(qDir, 16 * sizeof(LitQuadVert));
+
+			pspGuSetupLightingOrCpuMode(dirArr, Math::Vector3d(1.0f, 1.0f, 1.0f));
+			sceGumDrawArray(GU_TRIANGLE_STRIP, GU_NORMAL_32BITF | GU_VERTEX_32BITF | GU_TRANSFORM_3D, 4, nullptr, qDir);
+
+			// Test B (middle-left): GU_POINTLIGHT at (-0.2, 0, +0.5) -> pure red
+			LightEntry ptL = makeLight(LightEntry::kPoint, Math::Vector3d(1.0f, 0.0f, 0.0f));
+			ptL.position = Math::Vector3d(-0.20f, 0.0f, 0.5f);
+			ptL.worldPosition = Math::Vector4d(-0.20f, 0.0f, 0.5f, 1.0f);
+			ptL.falloffNear = 0.2f;
+			ptL.falloffFar = 4.0f;
+			LightEntryArray ptArr;
+			ptArr.push_back(&amb);
+			ptArr.push_back(&ptL);
+			pspGuSetupLightingOrCpuMode(ptArr, Math::Vector3d(1.0f, 1.0f, 1.0f));
+			sceGumDrawArray(GU_TRIANGLE_STRIP, GU_NORMAL_32BITF | GU_VERTEX_32BITF | GU_TRANSFORM_3D, 4, nullptr, qPt);
+
+			// Test C (right): GU_SPOTLIGHT at (0.30, 0, +0.4) pointing -Z, outer=25 deg
+			LightEntry spL = makeLight(LightEntry::kSpot, Math::Vector3d(0.0f, 0.0f, 1.0f));
+			spL.position = Math::Vector3d(0.30f, 0.0f, 0.4f);
+			spL.worldPosition = Math::Vector4d(0.30f, 0.0f, 0.4f, 1.0f);
+			spL.direction = Math::Vector3d(0.0f, 0.0f, -1.0f);
+			spL.innerConeAngle = Math::Angle(10.0f);
+			spL.outerConeAngle = Math::Angle(25.0f);
+			spL.falloffNear = 0.2f;
+			spL.falloffFar = 5.0f;
+			LightEntryArray spArr;
+			spArr.push_back(&amb);
+			spArr.push_back(&spL);
+			pspGuSetupLightingOrCpuMode(spArr, Math::Vector3d(1.0f, 1.0f, 1.0f));
+			sceGumDrawArray(GU_TRIANGLE_STRIP, GU_NORMAL_32BITF | GU_VERTEX_32BITF | GU_TRANSFORM_3D, 4, nullptr, qSpotIn);
+			sceGumDrawArray(GU_TRIANGLE_STRIP, GU_NORMAL_32BITF | GU_VERTEX_32BITF | GU_TRANSFORM_3D, 4, nullptr, qSpotOut);
+		}
+
+		sceGuDisable(GU_LIGHTING);
+		pspGuDisableAllLights();
+
+		_session->flushSceneSegment();
+		const bool readOk = _session->readSceneRectToRam(0, 0, 320, 240, readbackBuf, readbackStride);
+		_session->resumeSceneSegment();
+
+		if (readOk) {
+			// Sample center of each quad inside the RT viewport
+			const int32 cy = _rtViewport.top + _rtViewport.height() / 2;
+			const auto sampleX = [&](float ndcX) -> uint32 {
+				const int32 px = _rtViewport.left + (int32)((ndcX * 0.5f + 0.5f) * (float)_rtViewport.width());
+				return readbackBuf[cy * readbackStride + CLIP<int32>(px, 0, 319)];
+			};
+			const uint32 pxDir = sampleX(-0.70f);
+			const uint32 pxPt = sampleX(-0.20f);
+			const uint32 pxSpIn = sampleX(0.30f);
+			const uint32 pxSpOut = sampleX(0.82f);
+			const uint8 dirG = (uint8)((pxDir >> 8) & 0xFFu);
+			const uint8 ptR = (uint8)(pxPt & 0xFFu);
+			const uint8 spInB = (uint8)((pxSpIn >> 16) & 0xFFu);
+			const uint8 spOutB = (uint8)((pxSpOut >> 16) & 0xFFu);
+			hwLightsPass = (dirG > 200) && (ptR > 160) && (spInB > 160) && (spOutB < 30);
+			if (!hwLightsPass) {
+				debug("[STARK-PSP-STEP04] hwLight probe: dirG=%u ptR=%u spotInB=%u spotOutB=%u",
+				      dirG, ptR, spInB, spOutB);
+			}
+		}
+	}
+
+	// 3. >4 light CPU overflow + negative x_neg light fallback + 2-bone sceGuBoneMatrix skinning
+	{
+		set3DMode();
+		sceGuDisable(GU_TEXTURE_2D);
+		sceGuDisable(GU_DEPTH_TEST);
+		sceGuDisable(GU_LIGHTING);
+		pspGuDisableAllLights();
+		sceGuClearColor(0xFF000000u);
+		sceGuClear(GU_COLOR_BUFFER_BIT | GU_DEPTH_BUFFER_BIT);
+
+		Math::Matrix4 idMat;
+		idMat.setToIdentity();
+		pspGuLoadMatrix4(GU_PROJECTION, idMat);
+		pspGuLoadMatrix4(GU_VIEW, idMat);
+		pspGuLoadMatrix4(GU_MODEL, idMat);
+
+		LightEntry amb;
+		amb.type = LightEntry::kAmbient;
+		amb.color = Math::Vector3d(0.0f, 0.0f, 0.0f);
+		LightEntry dOff;
+		dOff.type = LightEntry::kDirectional;
+		dOff.color = Math::Vector3d(0.0f, 0.0f, 0.0f);
+		dOff.direction = Math::Vector3d(0.0f, 0.0f, -1.0f);
+		dOff.eyeDirection = dOff.direction;
+		LightEntry d5 = dOff;
+		d5.color = Math::Vector3d(0.0f, 1.0f, 1.0f); // 5th light: cyan (would be lost if truncated to 4)
+
+		LightEntryArray overflowArr;
+		overflowArr.push_back(&amb);
+		overflowArr.push_back(&dOff);
+		overflowArr.push_back(&dOff);
+		overflowArr.push_back(&dOff);
+		overflowArr.push_back(&dOff);
+		overflowArr.push_back(&d5);
+
+		LightEntry dNeg = dOff;
+		dNeg.color = Math::Vector3d(-0.6f, 0.0f, 0.0f);
+		LightEntry ambWhite = amb;
+		ambWhite.color = Math::Vector3d(1.0f, 0.5f, 0.0f);
+		LightEntryArray negArr;
+		negArr.push_back(&ambWhite);
+		negArr.push_back(&dNeg);
+
+		const bool rejectOverflow = !pspGuCanUseHardwareLights(overflowArr);
+		const bool rejectNeg = !pspGuCanUseHardwareLights(negArr);
+		const uint32 cOverflow = pspGuEvaluateLightsCpu(idMat, idMat,
+		                                                Math::Vector3d(0, 0, 0), Math::Vector3d(0, 0, 1),
+		                                                Math::Vector3d(1.0f, 1.0f, 1.0f), overflowArr);
+		const uint32 cNeg = pspGuEvaluateLightsCpu(idMat, idMat,
+		                                           Math::Vector3d(0, 0, 0), Math::Vector3d(0, 0, 1),
+		                                           Math::Vector3d(1.0f, 1.0f, 1.0f), negArr);
+
+		struct VertCpuCol {
+			uint32 color;
+			float x, y, z;
+		};
+		VertCpuCol *cpuQuads = static_cast<VertCpuCol *>(_session->allocVertices(8 * sizeof(VertCpuCol), 16));
+		if (cpuQuads) {
+			cpuQuads[0] = { cOverflow, -0.8f, -0.4f, 0.0f }; cpuQuads[1] = { cOverflow, -0.2f, -0.4f, 0.0f };
+			cpuQuads[2] = { cOverflow, -0.8f,  0.4f, 0.0f }; cpuQuads[3] = { cOverflow, -0.2f,  0.4f, 0.0f };
+			cpuQuads[4] = { cNeg,       0.2f, -0.4f, 0.0f }; cpuQuads[5] = { cNeg,       0.8f, -0.4f, 0.0f };
+			cpuQuads[6] = { cNeg,       0.2f,  0.4f, 0.0f }; cpuQuads[7] = { cNeg,       0.8f,  0.4f, 0.0f };
+			_session->flushDataRange(cpuQuads, 8 * sizeof(VertCpuCol));
+			sceGumDrawArray(GU_TRIANGLE_STRIP, GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_3D, 4, nullptr, cpuQuads);
+			sceGumDrawArray(GU_TRIANGLE_STRIP, GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_3D, 4, nullptr, cpuQuads + 4);
+		}
+
+		// 2-bone hardware skinning quad shifted to upper-right by bone1 translation (+0.4, +0.6, 0)
+		struct Skin2Vert {
+			float w0, w1;
+			uint32 color;
+			float x, y, z;
+		};
+		Math::Matrix4 bone0, bone1;
+		bone0.setToIdentity();
+		bone1.setToIdentity();
+		bone1.setPosition(Math::Vector3d(0.4f, 0.6f, 0.0f));
+		alignas(16) ScePspFMatrix4 sceB0, sceB1;
+		pspGuToSceMatrix(bone0, sceB0);
+		pspGuToSceMatrix(bone1, sceB1);
+		sceGuBoneMatrix(0, &sceB0);
+		sceGuBoneMatrix(1, &sceB1);
+
+		Skin2Vert *skinQuad = static_cast<Skin2Vert *>(_session->allocVertices(4 * sizeof(Skin2Vert), 16));
+		if (skinQuad) {
+			skinQuad[0] = { 0.0f, 1.0f, 0xFF00FF00u, -0.2f, -0.2f, 0.0f };
+			skinQuad[1] = { 0.0f, 1.0f, 0xFF00FF00u,  0.2f, -0.2f, 0.0f };
+			skinQuad[2] = { 0.0f, 1.0f, 0xFF00FF00u, -0.2f,  0.2f, 0.0f };
+			skinQuad[3] = { 0.0f, 1.0f, 0xFF00FF00u,  0.2f,  0.2f, 0.0f };
+			_session->flushDataRange(skinQuad, 4 * sizeof(Skin2Vert));
+			sceGumDrawArray(GU_TRIANGLE_STRIP,
+			                GU_WEIGHTS(2) | GU_WEIGHT_32BITF | GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_3D,
+			                4, nullptr, skinQuad);
+		}
+
+		_session->flushSceneSegment();
+		const bool readOk = _session->readSceneRectToRam(0, 0, 320, 240, readbackBuf, readbackStride);
+		_session->resumeSceneSegment();
+
+		if (readOk) {
+			const int32 cy = _rtViewport.top + _rtViewport.height() / 2;
+			const int32 xOv = _rtViewport.left + (int32)((-0.50f * 0.5f + 0.5f) * (float)_rtViewport.width());
+			const int32 xNg = _rtViewport.left + (int32)(( 0.50f * 0.5f + 0.5f) * (float)_rtViewport.width());
+			const uint32 pxOv = readbackBuf[cy * readbackStride + xOv];
+			const uint32 pxNg = readbackBuf[cy * readbackStride + xNg];
+			const uint8 ovR = (uint8)(pxOv & 0xFFu);
+			const uint8 ovG = (uint8)((pxOv >> 8) & 0xFFu);
+			const uint8 ovB = (uint8)((pxOv >> 16) & 0xFFu);
+			const uint8 ngR = (uint8)(pxNg & 0xFFu);
+			const uint8 ngG = (uint8)((pxNg >> 8) & 0xFFu);
+			cpuOverflowPass = rejectOverflow && rejectNeg &&
+			                  (ovR < 20 && ovG > 220 && ovB > 220) &&
+			                  (ngR >= 85 && ngR <= 120 && ngG >= 115 && ngG <= 145);
+
+			const int32 skY = _rtViewport.top + (int32)((1.0f - (0.60f * 0.5f + 0.5f)) * (float)_rtViewport.height());
+			const int32 skX = _rtViewport.left + (int32)(( 0.40f * 0.5f + 0.5f) * (float)_rtViewport.width());
+			const uint32 pxSk = readbackBuf[CLIP<int32>(skY, 0, 239) * readbackStride + CLIP<int32>(skX, 0, 319)];
+			skin2BonePass = (((pxSk >> 8) & 0xFFu) > 220) && ((pxSk & 0xFFu) < 20);
+			if (!skin2BonePass) {
+				int32 minGx = 999, maxGx = -1, minGy = 999, maxGy = -1;
+				for (int32 py = 0; py < 240; py += 2) {
+					for (int32 px = 0; px < 320; px += 2) {
+						const uint32 c = readbackBuf[py * readbackStride + px];
+						if (((c >> 8) & 0xFFu) > 220 && (c & 0xFFu) < 20 && ((c >> 16) & 0xFFu) < 20) {
+							if (px < minGx) minGx = px;
+							if (px > maxGx) maxGx = px;
+							if (py < minGy) minGy = py;
+							if (py > maxGy) maxGy = py;
+						}
+					}
+				}
+				debug("[STARK-PSP-STEP04] skin2Bone probe (%d,%d)=0x%08x greenBbox=[%d..%d, %d..%d]",
+				      skX, skY, pxSk, minGx, maxGx, minGy, maxGy);
+			}
+		}
+	}
+
+	// 4. Synthetic >65535-vertex / >49140-index prop split + zero-leak teardown
+	{
+		const uint32 kBigVerts = 65541;
+		Common::Array<Formats::BiffMesh::Vertex> srcVerts;
+		srcVerts.resize(kBigVerts);
+		for (uint32 vi = 0; vi < kBigVerts; ++vi) {
+			srcVerts[vi].position = Math::Vector3d((float)(vi % 16), (float)((vi / 16) % 16), 0.0f);
+			srcVerts[vi].normal = Math::Vector3d(0.0f, 0.0f, 1.0f);
+			srcVerts[vi].texturePosition = Math::Vector3d(0.0f, 0.0f, 0.0f);
+		}
+		Face bigFace;
+		bigFace.materialId = 0;
+		bigFace.vertexIndices.resize(kBigVerts);
+		for (uint32 vi = 0; vi < kBigVerts; ++vi) {
+			bigFace.vertexIndices[vi] = vi;
+		}
+		Common::Array<Face> faces;
+		faces.push_back(bigFace);
+		Material mat = Material();
+		mat.r = 1.0f; mat.g = 1.0f; mat.b = 1.0f;
+		mat.doubleSided = false;
+		Common::Array<Material> mats;
+		mats.push_back(mat);
+
+		Formats::BiffMesh *bigMesh = new Formats::BiffMesh(srcVerts, faces, mats);
+		PspGuPropRenderer *propR = new PspGuPropRenderer(this);
+		propR->setModel(bigMesh); // VisualProp takes ownership of bigMesh
+		propR->buildBatches();
+
+		bool allWithinLimit = (propR->_batches.size() >= 2);
+		uint32 sumIndices = 0;
+		for (uint32 bi = 0; bi < propR->_batches.size(); ++bi) {
+			const PspGuPropRenderer::Batch &b = propR->_batches[bi];
+			if (b.vertexCount > 65535 || b.indexCount > 49140) {
+				allWithinLimit = false;
+			}
+			sumIndices += b.indexCount;
+		}
+		propSplitPass = allWithinLimit && (sumIndices == kBigVerts);
+		delete propR; // frees batches and bigMesh via ~VisualProp()
+	}
+
+	const bool zeroLeakPass = (s_liveAuxBytes == liveAuxBefore);
+
+	// Reset cleanly to black before returning to startup/frame 0
+	if (ensureFrameBegun()) {
+		setScreenViewport(false);
+		sceGuDisable(GU_TEXTURE_2D);
+		sceGuDisable(GU_BLEND);
+		sceGuDisable(GU_LIGHTING);
+		sceGuDisable(GU_CLIP_PLANES);
+		pspGuDisableAllLights();
+		sceGuClearColor(0xFF000000u);
+		sceGuClear(GU_COLOR_BUFFER_BIT | GU_DEPTH_BUFFER_BIT);
+	}
+	_session->submitFrame(false);
+	_session->waitFrame();
+
+	debug("[STARK-PSP-STEP04] contracts: matParity=%s clipPlane=%s hwLights=%s cpuOverflow=%s skin2Bone=%s propSplit=%s zeroLeak=%s liveAux=%u",
+	      matParityPass ? "OK" : "FAIL",
+	      clipPlanePass ? "OK" : "FAIL",
+	      hwLightsPass ? "OK" : "FAIL",
+	      cpuOverflowPass ? "OK" : "FAIL",
+	      skin2BonePass ? "OK" : "FAIL",
+	      propSplitPass ? "OK" : "FAIL",
+	      zeroLeakPass ? "OK" : "FAIL",
+	      s_liveAuxBytes);
+
+	return matParityPass && clipPlanePass && hwLightsPass &&
+	       cpuOverflowPass && skin2BonePass && propSplitPass && zeroLeakPass;
+}
+
 void PspGuDriver::verifyStartupContracts() {
 	if (!_session) {
 		return;
@@ -787,6 +1455,7 @@ void PspGuDriver::verifyStartupContracts() {
 		}
 
 		verifyStep03SurfaceAndTextureContracts(readbackBuf, readbackStride);
+		verifyStep04HardwareTLContracts(readbackBuf, readbackStride);
 	}
 	free(readbackBuf);
 
@@ -1031,6 +1700,16 @@ void PspGuDriver::set3DMode() {
 	if (_session && _session->isFrameOpen()) {
 		applySceneViewport();
 		applyDepthConfig(_reverseDepth);
+		sceGuEnable(GU_CLIP_PLANES);
+		sceGuDisable(GU_CULL_FACE);
+		sceGuDisable(GU_BLEND);
+		sceGuDisable(GU_ALPHA_TEST);
+		sceGuDisable(GU_STENCIL_TEST);
+		sceGuDisable(GU_LIGHTING);
+		pspGuDisableAllLights();
+		sceGuShadeModel(GU_SMOOTH);
+		sceGuSpecular(0.0f);
+		sceGuPixelMask(0x00000000);
 	}
 }
 
@@ -1047,7 +1726,7 @@ void PspGuDriver::reportUnimplemented(const char *methodName) {
 	const uint32 bit = 1u << (hash & 31u);
 	if ((_unimplementedMask & bit) == 0) {
 		_unimplementedMask |= bit;
-		warning("STARK PSP Step03: %s is developmentally unavailable (unimplemented until Step 04+)",
+		warning("STARK PSP Step04: %s is developmentally unavailable (unimplemented until Step 05+)",
 		        methodName ? methodName : "unknown");
 	}
 }

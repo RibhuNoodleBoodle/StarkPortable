@@ -23,7 +23,12 @@
 #define STARK_GFX_PSPGU_H
 
 #include "engines/stark/gfx/driver.h"
+#include "engines/stark/gfx/renderentry.h"
 #include "common/rect.h"
+#include "math/matrix4.h"
+#include "math/vector3d.h"
+
+#include <psptypes.h>
 
 class PspGuSession;
 
@@ -31,7 +36,7 @@ namespace Stark {
 namespace Gfx {
 
 /**
- * Shared PSP GE conversion and memory-budget utilities for Step 03+ resources.
+ * Shared PSP GE conversion, 3D transform/lighting, and memory-budget utilities.
  */
 uint32 pspGuNextPow2Clamped(uint32 value, uint32 minPow2 = 8, uint32 maxPow2 = 512);
 int pspGuClassifySurfacePsm(const Graphics::Surface *src, const byte *palette);
@@ -43,6 +48,17 @@ void pspGuCopySurfaceRectToRgba8888(const Graphics::Surface *src, const byte *pa
                                     uint32 *dst, uint32 dstStride);
 void pspGuResampleSurfaceToRgba8888(const Graphics::Surface *src, const byte *palette,
                                     uint32 dstW, uint32 dstH, uint32 *dst, uint32 dstStride);
+void pspGuWritebackCache64(const void *ptr, uint32 bytes);
+void pspGuToSceMatrix(const Math::Matrix4 &mat, ScePspFMatrix4 &out);
+void pspGuLoadMatrix4(int matrixMode, const Math::Matrix4 &mat);
+uint32 pspGuPackAbgrFloats(float r, float g, float b, float a = 1.0f);
+bool pspGuCanUseHardwareLights(const LightEntryArray &lights);
+void pspGuDisableAllLights();
+bool pspGuSetupLightingOrCpuMode(const LightEntryArray &lights, const Math::Vector3d &matRgb);
+uint32 pspGuEvaluateLightsCpu(const Math::Matrix4 &modelView, const Math::Matrix4 &normalRot,
+                              const Math::Vector3d &modelPos, const Math::Vector3d &modelNormal,
+                              const Math::Vector3d &baseRgb, const LightEntryArray &lights);
+
 void pspGuTrackBitmapBytes(int32 deltaBytes);
 void pspGuTrackTextureBytes(int32 deltaBytes);
 void pspGuTrackAuxBytes(int32 deltaBytes);
@@ -102,6 +118,7 @@ private:
 	void updateRtViewport();
 	void verifyStartupContracts();
 	bool verifyStep03SurfaceAndTextureContracts(uint32 *readbackBuf, uint32 readbackStride);
+	bool verifyStep04HardwareTLContracts(uint32 *readbackBuf, uint32 readbackStride);
 
 	PspGuSession *_session;
 	Common::Rect _viewport;

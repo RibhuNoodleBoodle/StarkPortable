@@ -23,6 +23,7 @@
 #define STARK_GFX_PSPGU_PROP_H
 
 #include "engines/stark/visual/prop.h"
+#include "common/array.h"
 
 namespace Stark {
 namespace Gfx {
@@ -30,17 +31,49 @@ namespace Gfx {
 class PspGuDriver;
 
 /**
- * Step 01 placeholder 3D prop renderer for native PSP sceGu driver.
+ * Native PSP GE 3D prop renderer with cached indexed static batches,
+ * material UV orientation, and hardware/CPU-fallback lighting.
  */
 class PspGuPropRenderer : public VisualProp {
 public:
+	struct PropVertexHW {
+		float u, v;
+		float nx, ny, nz;
+		float x, y, z;
+	};
+
+	struct PropVertexCpuLit {
+		float u, v;
+		uint32 color;
+		float x, y, z;
+	};
+
+	struct Batch {
+		uint32 materialId;
+		PropVertexHW *verts;
+		uint16 *indices;
+		uint32 vertexCount;
+		uint32 indexCount;
+		uint32 allocBytes;
+	};
+
 	explicit PspGuPropRenderer(PspGuDriver *gfx);
 	~PspGuPropRenderer() override;
 
 	void render(const Math::Vector3d &position, float direction, const Gfx::LightEntryArray &lights) override;
 
 private:
+	friend class PspGuDriver;
+
+	void clearBatches();
+	void buildBatches();
+
 	PspGuDriver *_gfx;
+	const Formats::BiffMesh *_cachedModel;
+	Common::Array<Batch> _batches;
+	PropVertexCpuLit *_cpuLitScratch;
+	uint32 _cpuLitScratchCap;
+	uint32 _lastDrawnFrameSeq;
 };
 
 } // End of namespace Gfx

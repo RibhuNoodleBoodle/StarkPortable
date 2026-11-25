@@ -87,6 +87,8 @@ void PspGuFadeRenderer::render(float fadeVal) {
 	sceGuDisable(GU_DEPTH_TEST);
 	sceGuDepthMask(GU_TRUE);
 	sceGuDisable(GU_LIGHTING);
+	pspGuDisableAllLights();
+	sceGuDisable(GU_CLIP_PLANES);
 	sceGuDisable(GU_CULL_FACE);
 	sceGuDisable(GU_ALPHA_TEST);
 	sceGuDisable(GU_STENCIL_TEST);

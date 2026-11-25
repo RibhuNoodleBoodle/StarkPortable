@@ -23,6 +23,7 @@
 #define STARK_GFX_PSPGU_ACTOR_H
 
 #include "engines/stark/visual/actor.h"
+#include "common/array.h"
 
 namespace Stark {
 namespace Gfx {
@@ -30,17 +31,76 @@ namespace Gfx {
 class PspGuDriver;
 
 /**
- * Step 01 placeholder 3D actor renderer for native PSP sceGu driver.
+ * Native PSP GE 3D actor renderer with static hardware-skinned (<=8 bone)
+ * batches for rigid geometry, bind-equivalence audited seam handling, facial
+ * texture resolution, and hardware/CPU-fallback lighting.
  */
 class PspGuActorRenderer : public VisualActor {
 public:
+	struct RigidBatch {
+		uint32 materialId;
+		uint8 bones[8];
+		uint8 boneCount;
+		int vtype;
+		uint32 floatStride;
+		float *verts;
+		uint16 *indices;
+		uint32 vertexCount;
+		uint32 indexCount;
+		uint32 allocBytes;
+	};
+
+	struct SeamVertex {
+		float pos1[3];
+		float pos2[3];
+		float normal[3];
+		float u, v;
+		uint16 bone1;
+		uint16 bone2;
+		float weight;
+	};
+
+	struct SeamVertHW {
+		float u, v;
+		float nx, ny, nz;
+		float x, y, z;
+	};
+
+	struct SeamVertCpuLit {
+		float u, v;
+		uint32 color;
+		float x, y, z;
+	};
+
+	struct SeamBatch {
+		uint32 materialId;
+		SeamVertex *srcVerts;
+		uint16 *indices;
+		SeamVertHW *dynHwVerts;
+		SeamVertCpuLit *dynCpuVerts;
+		uint32 vertexCount;
+		uint32 indexCount;
+		uint32 staticAllocBytes;
+		uint32 dynAllocBytes;
+	};
+
 	explicit PspGuActorRenderer(PspGuDriver *gfx);
 	~PspGuActorRenderer() override;
 
 	void render(const Math::Vector3d &position, float direction, const Common::Array<Gfx::LightEntry *> &lights) override;
 
 private:
+	void clearBatches();
+	void buildBatches();
+	void evaluateBindAuditAndSeamSkin(const Common::Array<Math::Matrix4> &boneMats, bool canHwLights);
+
 	PspGuDriver *_gfx;
+	Common::Array<RigidBatch> _rigidBatches;
+	Common::Array<SeamBatch> _seamBatches;
+	SeamVertCpuLit *_rigidCpuScratch;
+	uint32 _rigidCpuScratchCap;
+	bool _bindAudited;
+	uint32 _lastDrawnFrameSeq;
 };
 
 } // End of namespace Gfx
