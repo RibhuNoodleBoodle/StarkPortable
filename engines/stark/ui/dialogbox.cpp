@@ -231,28 +231,36 @@ Gfx::Bitmap *DialogBox::loadBackground(Gfx::Driver *gfx) {
 		return nullptr;
 	}
 
-	const uint32 bitmapWithHeaderLen = stream->size() + 14;
-	byte *bitmapWithHeader = new byte[bitmapWithHeaderLen];
+	const int64 resourceSize = stream->size();
+	if (resourceSize <= 0 || resourceSize > 0x7fffffff - 14) {
+		delete stream;
+		delete executable;
+		return nullptr;
+	}
+	const uint32 bitmapWithHeaderLen = (uint32)resourceSize + 14;
+	Common::Array<byte> bitmapWithHeader(bitmapWithHeaderLen);
 
-	Common::MemoryWriteStream bitmapWithHeaderWriteStream(bitmapWithHeader, bitmapWithHeaderLen);
+	Common::MemoryWriteStream bitmapWithHeaderWriteStream(bitmapWithHeader.data(), bitmapWithHeaderLen);
 	bitmapWithHeaderWriteStream.write("BM", 2);
 	bitmapWithHeaderWriteStream.writeUint32LE(bitmapWithHeaderLen); // Filesize
 	bitmapWithHeaderWriteStream.writeUint32LE(0);                   // res1 & res2
 	bitmapWithHeaderWriteStream.writeUint32LE(0x436);               // image offset
 
-	stream->read(bitmapWithHeader + 14, stream->size());
+	const bool complete = stream->read(bitmapWithHeader.data() + 14, (uint32)resourceSize) == (uint32)resourceSize && !stream->err();
 	delete stream;
 	delete executable;
+	if (!complete) {
+		warning("Unable to read the modal dialog background bitmap");
+		return nullptr;
+	}
 
-	Common::MemoryReadStream bitmapWithHeaderReadStream(bitmapWithHeader, bitmapWithHeaderLen);
+	Common::MemoryReadStream bitmapWithHeaderReadStream(bitmapWithHeader.data(), bitmapWithHeaderLen);
 
 	Image::BitmapDecoder decoder;
 	if (!decoder.loadStream(bitmapWithHeaderReadStream)) {
 		warning("Unable decode the modal dialog background bitmap from 'game.exe'");
 		return nullptr;
 	}
-
-	delete[] bitmapWithHeader;
 
 	return gfx->createBitmap(decoder.getSurface(), decoder.getPalette().data());
 }

@@ -1,0 +1,139 @@
+ChatGPT Terra implementation prompt | Readable STARK text at 320x240 on PSP
+
+Work in the scummvm-psp checkout. Make The Longest Journey's in-game text
+legible on a PSP at normal viewing size. Give small letters enough scene
+pixels for their strokes, counters (the openings in letters like "e"), and
+punctuation to survive presentation. Fix the two ownership defects below and
+investigate further leaks exposed by the gameplay and teardown checks.
+Deliver working source changes and measured results.
+
+The scene must stay 320x240. Keep the 640x480 game and input coordinates,
+the centered 362x272 picture on the 480x272 LCD, and the existing GE scene
+and presentation passes. Draw text into the scene so it appears in menus,
+screenshots and save thumbnails as before. Keep the readability changes
+local to PSP STARK. Preserve the user's font antialiasing choice, the game's
+font families and localization, and the appearance of non-text art.
+
+Start from the current working tree. This review used HEAD 1bab165e plus
+local Terra changes, including changes to pspgu.cpp and pspgubitmap.cpp.
+Use that same starting source as the comparison build. Read the latest
+handoff.txt entry for the build context. Preserve the existing local work.
+
+1. Follow a small hint and a subtitle all the way to the LCD
+
+In engines/stark/services/fontprovider.cpp, FontHolder reads gui.ini or
+uses defaults such as 12 for small Garamond and 19 for big Florentine
+Script. It derives _scaledHeight from the screen viewport and requests a
+FreeType cell height. In engines/stark/visual/text.cpp, createBitmap wraps
+at a scaled width, draws white glyphs to an RGBA surface, extracts coverage,
+calls blendWithColor and multiplyColorWithAlpha, then uploads a nearest-
+filtered bitmap. VisualText already requests grid snapping and a no-scaling
+override. In gfx/pspgu.cpp, mapLogical2DRectToRt still scales the bitmap
+extent by render-target viewport / current viewport with that override.
+At a full 640x480 viewport, a 12-pixel logical cell occupies only six scene
+rows before accounting for the font's own ascent, descent and whitespace.
+The final LCD blit in backends/platform/psp/display_manager.cpp uses linear
+filtering. Grid snapping alone cannot recover a stem lost in the first draw.
+
+Capture the actual font, cell height, wrap width, bitmap and drawn-quad
+dimensions for the two strings. Inspect the glyph mask, the 320x240 scene
+and the final LCD. Check thin strokes at adjacent logical origins and on
+both light and dark backgrounds. Trace partial coverage through the two
+color helpers, GU premultiplied blending, and pspGuClassifySurfacePsm for
+long text. Establish which stage loses detail before changing it.
+
+2. Implement a text-specific pixel size and layout
+
+Start by trying hinted glyphs rasterized for the scene pixel grid and drawn
+at one bitmap texel per scene pixel. Set a modest minimum effective cell
+height for the smallest font roles. Compare, for example, 9, 10 and 11
+scene pixels for the 12-unit small font. Choose by the actual lowercase
+height, stroke continuity and fit of the shipped faces. Use the same
+process for small custom fonts and subtitles. Keep larger headings distinct.
+If coverage is the limiting factor, tune text-only coverage or hinting
+and verify colored text and dark text on a highlighted option. Preserve
+open counters and spacing between letters. Record the selected sizes and
+the observed reason for them.
+
+Keep anchors and interactive rectangles in logical game coordinates. Use
+consistent conversions for wrap width, advances, baseline, line spacing,
+background fill, bitmap extent, and conversion of measured bounds back to
+VisualText::getRect(). Account for glyph bearings and accents. A bitmap
+rasterized at scene density needs a matching draw extent to avoid a second
+halving in mapLogical2DRectToRt. Keep other sprites on their existing path.
+Cache a completed text bitmap across ordinary frames and invalidate it
+when text, style or effective font metrics change.
+
+Exercise the 96-unit cursor/inventory hints, 600-unit subtitles and dialogue
+choices, a modal confirm/cancel pair, save descriptions, and a custom-font
+ImageText hotspot. ClickText caches its logical bounding box and DialogPanel
+uses the option heights for scrolling. Verify the first and last visible
+options can be focused and selected, including after a long line wraps.
+Ensure long subtitles fit their panel and narrow labels remain readable.
+Keep the configured target rectangle for blank clickable text and the
+White Cardinal workaround in resources/image.cpp. Test accents, descenders,
+right alignment and the existing BiDi path, using diagnostic strings where
+a localized save is unavailable. Distinguish lettering baked into artwork
+from text that actually goes through VisualText when reporting coverage.
+
+3. Repair and verify ownership
+
+* Rejected font load. FontHolder creates a MemoryReadStream borrowing the
+  bytes in _ttfDataCache and passes it to Graphics::loadTTFFont with
+  DisposeAfterUse::YES. In graphics/fonts/ttf.cpp, TTFFont takes ownership
+  only on successful initialization. The factory returns null on failure,
+  and FontHolder loses the wrapper. Follow the failure handling in
+  loadTTFFontFromArchive. Retain a local owner until success, release the
+  wrapper exactly once on failure, and preserve the default-font fallback.
+  Test a present but rejected TTF repeatedly as well as a valid one. A
+  missing file exercises a different branch. Keep the cached bytes alive
+  until all borrowing faces close and keep the disk handles short-lived.
+
+* Failed dialog background decode. In engines/stark/ui/dialogbox.cpp,
+  DialogBox::loadBackground allocates bitmapWithHeader with new[], wraps
+  it in a non-owning MemoryReadStream, and returns early if BitmapDecoder
+  rejects it. The delete[] runs only on success. Give the temporary bytes
+  a scoped owner with a matching deallocator. Validate the size and read
+  count before decoding. Preserve the solid-color fallback. Exercise both
+  valid and deliberately truncated data using a private copy or a fixture.
+
+* Follow lifetime through font reinitialization, VisualText replacement,
+  glyph caches, temporary raster surfaces, PSP bitmap tiles and fade masks,
+  menu close, room changes and return to launcher. Preserve GE fencing.
+  For each further leak identified, record the allocation, missing release,
+  trigger and evidence after the fix. Distinguish a reusable font or glyph
+  cache from per-entry growth. Reuse bounded allocations where appropriate.
+
+4. Acceptance and handoff
+
+Use external build directories for the pre-change native build, candidate
+and STARK_PSP_DIAGNOSTICS build. Run these commands from the corresponding
+source root with the installed SDK and private lab paths.
+
+  LAB=/absolute/private/candidate PSPDEV=/path/to/pspdev JOBS=4 bash gemini_hydrogen/tools/build-psp-lab.sh native
+  LAB=/absolute/private/candidate bash gemini_hydrogen/tools/launch-psp-lab.sh A /absolute/private/candidate/build-native/EBOOT.PBP
+
+Use the same game data, save, clock, language and settings for comparisons.
+Use profile A at 1x for gameplay and profile B for repeatable GE readbacks.
+Compare the same named strings in baseline and candidate scene and LCD
+captures. Inspect the final 480x272 image at 1:1. Report lowercase ink
+height in scene pixels, a thin stroke that survives, line counts and
+whether each clickable label matches its highlight and responds at its
+edges. Include AA on and off and at least one multi-line example.
+
+Warm the same strings first, then repeat a fixed sequence of hint changes,
+dialogue choices, menu open/close and a room round trip at least 20 times.
+Sample at the same settled point after GE retirement. Repeat exit to
+launcher and re-entry. Compare guest heap use, live bitmap/texture/auxiliary
+bytes, font/stream owners and open file handles. Track CPU-side wrappers
+separately from the GE counters. Use focused host allocation checks
+or LeakSanitizer for the two failure paths where practical. Report peak and
+post-teardown counts, unexplained growth, and effects on frame timing during
+text changes and steady display. Keep detailed probes in diagnostic builds.
+
+Deliver the fixes and a short handoff with build identity, commands, chosen
+font metrics, example strings, visual results, memory deltas and remaining
+coverage gaps. Keep saves, game data, builds and captures in the private
+lab. Identify which observations came from PPSSPP and which came from an
+actual PSP LCD. If the SDK, a room or hardware is unavailable, finish the
+independent checks and state exactly what still needs verification.

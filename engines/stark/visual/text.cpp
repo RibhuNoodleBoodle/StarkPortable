@@ -244,8 +244,13 @@ void VisualText::createBitmap() {
 	// Get the font and required metrics
 	const Graphics::Font *font = StarkFontProvider->getScaledFont(_fontType, _fontCustomIndex);
 	uint scaledLineHeight = StarkFontProvider->getScaledFontHeight(_fontType, _fontCustomIndex);
+#ifndef __PSP__
 	uint originalLineHeight = StarkFontProvider->getOriginalFontHeight(_fontType, _fontCustomIndex);
+#endif
 	uint maxScaledLineWidth = StarkGfx->scaleWidthOriginalToCurrent(_targetWidth);
+#ifdef __PSP__
+	maxScaledLineWidth = MAX<uint>(1, _targetWidth / 2);
+#endif
 
 	// Word wrap the text
 	Common::Array<Common::U32String> lines;
@@ -269,8 +274,13 @@ void VisualText::createBitmap() {
 		scaledRect.right = MAX<int16>(scaledRect.right, maxScaledLineWidth);
 
 	if (!isBlank()) {
+#ifdef __PSP__
+		_originalRect.right = scaledRect.right * 2;
+		_originalRect.bottom = scaledRect.bottom * 2;
+#else
 		_originalRect.right = StarkGfx->scaleWidthCurrentToOriginal(scaledRect.right);
 		_originalRect.bottom = originalLineHeight * lines.size();
+#endif
 	} else {
 		// For Empty text, preserve the original width and height for being used as clicking area
 		_originalRect.right = _targetWidth;
@@ -316,10 +326,18 @@ void VisualText::render(const Common::Point &position) {
 	}
 
 	if (_backgroundColor.a != 0) {
+#ifdef __PSP__
+		_surfaceRenderer->fill(_backgroundColor, position, _bitmap->width() * 2, _bitmap->height() * 2);
+#else
 		_surfaceRenderer->fill(_backgroundColor, position, _bitmap->width(), _bitmap->height());
+#endif
 	}
 
+#ifdef __PSP__
+	_surfaceRenderer->render(_bitmap, position, _bitmap->width() * 2, _bitmap->height() * 2);
+#else
 	_surfaceRenderer->render(_bitmap, position);
+#endif
 }
 
 void VisualText::reset() {

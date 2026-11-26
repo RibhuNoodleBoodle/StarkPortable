@@ -318,3 +318,6 @@ __pycache__/
 #Ignore Claude instruction files
 CLAUDE.md
 .claude
+
+# Local PSP toolchain and its source checkout
+/pspdev/

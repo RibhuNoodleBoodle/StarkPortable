@@ -129,6 +129,10 @@ FontProvider::FontHolder::FontHolder(FontProvider *fontProvider, const Common::S
 	_name = name;
 	_originalHeight = height;
 	_scaledHeight = StarkGfx->scaleHeightOriginalToCurrent(_originalHeight);
+#ifdef __PSP__
+	// Rasterize directly for the 320x240 scene, with a readable minimum.
+	_scaledHeight = MAX<uint32>(10, (_originalHeight + 1) / 2);
+#endif
 
 	// Fetch the font file name
 	const Common::String &ttfFile = fontProvider->_ttfFileMap[_name];
@@ -166,6 +170,9 @@ FontProvider::FontHolder::FontHolder(FontProvider *fontProvider, const Common::S
 		_font = Common::SharedPtr<Graphics::Font>(
 				Graphics::loadTTFFont(s, DisposeAfterUse::YES, _scaledHeight, Graphics::kTTFSizeModeCell, 0, 0, renderMode, nullptr, stemDarkening)
 		);
+		if (!_font) {
+			delete s;
+		}
 	} else {
 		warning("Unable to load the font '%s'", ttfFileName.toString().c_str());
 	}
