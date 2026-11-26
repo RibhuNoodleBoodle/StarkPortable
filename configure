@@ -953,9 +953,7 @@ Usage: $0 [OPTIONS]...
 
 Configuration:
   -h, --help               display this help and exit
-  --backend=BACKEND        backend to build (3ds, atari, android, dc, ds, ios7,
-                           maemo, n64, null, opendingux, openpandora, psp, psp2,
-                           samsungtv, sdl, switch, wii) [sdl]
+  --backend=psp            build the PSP backend
 
 Installation directories:
   --prefix=PREFIX          install architecture-independent files in PREFIX
@@ -980,37 +978,7 @@ Fine tuning of the installation directories:
   --docdir=DIR             documentation root [DATAROOTDIR/doc/scummvm]
 
 Special configuration feature:
-  --host=HOST              cross-compile to target HOST (arm-linux, ...)
-                           special targets: 3ds for Nintendo 3DS
-                                            android-arm-v7a for Android ARMv7-A (armeabi-v7a)
-                                            android-arm64-v8a for Android ARMv8-A (arm64-v8a)
-                                            android-x86 for Android x86
-                                            android-x86_64 for Android x86_64
-                                            raspberrypi for Raspberry Pi
-                                            dreamcast for Sega Dreamcast
-                                            ds for Nintendo DS
-                                            gamecube for Nintendo GameCube
-                                            ios7 for Apple iPhone / iPad (iOS >= 7)
-                                            ios7-arm64 for Apple iPhone / iPad (iOS >= 7, 64-bit)
-                                            kos32 for Kolibri OS
-                                            maemo for Nokia Maemo
-                                            miyoo for 1st generation Miyoo
-                                            miyoomini for Miyoo Mini
-                                            n64 for Nintendo 64
-                                            opendingux-gcw0 for GCW0 with Opendingux Beta
-                                            opendingux-lepus for Lepus with Opendingux Beta
-                                            opendingux-rs90 for RS90 and RG99 with Opendingux Beta
-                                            openpandora for OpenPandora
-                                            ouya for OUYA
-                                            ps3 for PlayStation 3
-                                            psp2 for PlayStation Vita
-                                            psp for PlayStation Portable
-                                            sailfish for SailfishOS
-                                            samsungtv for Samsung TV
-                                            switch for Nintendo Switch
-                                            tvos for Apple TV (tvOS 9.0+)
-                                            wasm32-unknown-emscripten for WebAssembly
-                                            wii for Nintendo Wii
+  --host=psp               cross-compile for PlayStation Portable
 
 Game engines:
   --enable-all-engines     enable all engines, including those which are broken
@@ -1787,6 +1755,11 @@ for ac_option in $@; do
 		;;
 	esac
 done
+
+if test "$_host" != psp; then
+	echo "This checkout supports PSP builds only. Pass --host=psp."
+	exit 1
+fi
 
 guessed_host=`$_srcdir/config.guess`
 get_system_exe_extension $guessed_host

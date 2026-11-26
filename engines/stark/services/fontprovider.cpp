@@ -130,8 +130,8 @@ FontProvider::FontHolder::FontHolder(FontProvider *fontProvider, const Common::S
 	_originalHeight = height;
 	_scaledHeight = StarkGfx->scaleHeightOriginalToCurrent(_originalHeight);
 #ifdef __PSP__
-	// Rasterize directly for the 320x240 scene, with a readable minimum.
-	_scaledHeight = MAX<uint32>(10, (_originalHeight + 1) / 2);
+	// Rasterize directly for the 320x240 scene, with larger readable text.
+	_scaledHeight = MAX<uint32>(12, (_originalHeight * 3 + 4) / 5);
 #endif
 
 	// Fetch the font file name
