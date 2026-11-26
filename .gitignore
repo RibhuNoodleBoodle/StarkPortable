@@ -321,3 +321,8 @@ CLAUDE.md
 
 # Local PSP toolchain and its source checkout
 /pspdev/
+
+# Local implementation prompts and planning notes
+/Astra_High_STARK_PSP_sceGU.txt
+/ChatGPT_Terra_STARK_PSP*.txt
+/gemini_hydrogen/*.txt
